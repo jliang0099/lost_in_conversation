@@ -1,6 +1,6 @@
 import json
 from utils import extract_conversation
-from model_openai import generate_json
+from model_huggingface import generate_json
 from tasks import get_task
 
 
@@ -35,20 +35,20 @@ class SystemAgent:
         last_turn_text = extract_conversation(conversation_so_far, to_str=True, only_last_turn=True)
 
         # print("--------------------- TURN CLASSIFICATION ---------------------")
-        # print(last_turn_text)
+        # print(f"[debug] last_turn_text:\n{last_turn_text}\n---")
 
         system_verification_prompt_populated = self.system_verification_prompt.replace("[[CONVERSATION_SO_FAR]]", last_turn_text).replace("[[INITIAL_SHARD]]", initial_query).replace("[[SHARDS]]", json.dumps(shards)).replace("[[ANSWER_DESCRIPTION]]", self.answer_description)
         system_verification_response_obj = generate_json([{"role": "user", "content": system_verification_prompt_populated}], model=self.system_model, return_metadata=True, temperature=0.0)
         system_verification_response = system_verification_response_obj["message"]
 
-        # print(system_verification_response)
+        # print(f"[debug] system_verification_response:\n{system_verification_response}\n---")
         # print("--------------------- END TURN CLASSIFICATION ---------------------")
 
         return system_verification_response, system_verification_response_obj["total_usd"]
 
     def extract_answer(self, conversation_so_far):
         assistant_response = [msg["content"] for msg in conversation_so_far if msg["role"] == "assistant"][-1]
-
+        
         if self.answer_extraction_strategy == "full_response":
             return assistant_response # just return the full response
         elif self.answer_extraction_strategy == "task_specific":

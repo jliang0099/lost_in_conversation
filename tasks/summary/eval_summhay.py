@@ -1,5 +1,5 @@
 import json, numpy as np, re, os
-from model_openai import generate_json
+from model_huggingface import generate_json
 
 def summary2bullets(summary, max_summary_length=300):
     bullets = summary.split("\n")
