@@ -1,12 +1,13 @@
 import json
 import random
 
+from activation_tracker import ActivationTracker
 from utils import print_colored, extract_conversation, date_str
-from utils_log import log_conversation
+from utils_log import log_conversation, save_conversation_hidden_states
 from system_agent import SystemAgent
-from model_huggingface import generate
 from user_agent import UserAgent
 from tasks import get_task
+from model_huggingface import generate
 
 # ──────────────────────────────────────────────
 # HuggingFace generate() — drop-in replacement for model_openai.generate()
@@ -33,20 +34,21 @@ class ConversationSimulatorSharded:
         assistant_model="meta-llama/Llama-3.1-8B-Instruct",
         system_model="meta-llama/Llama-3.1-8B-Instruct",
         user_model="meta-llama/Llama-3.1-8B-Instruct",
-        assistant_temperature=1.0,
-        user_temperature=1.0,
+        assistant_temperature=0,
+        user_temperature=0,
         dataset_fn=None,
         log_folder="logs",
         hf_backend: Optional[str] = None,   # "local" | "api" | None (use env var)
+        track_activation=False,
     ):
         self.task_name = sample["task"]
         self.task = get_task(self.task_name)
         self.dataset_fn = dataset_fn
         self.sample = sample
-        self.assistant_model = assistant_model
         self.system_model = system_model
         self.user_model = user_model
         self.user_agent = UserAgent(self.task, user_model)
+        self.assistant_model = assistant_model
         self.system_agent = SystemAgent(self.task_name, system_model, self.sample)
         self.log_folder = log_folder
         self.system_message = self.task.generate_system_prompt(self.sample)
@@ -57,16 +59,20 @@ class ConversationSimulatorSharded:
         self.assistant_temperature = assistant_temperature
         self.user_temperature = user_temperature
 
-        self.trace = [{"role": "system", "content": self.system_message, "timestamp": date_str()}]
+        # self.trace = [{"role": "system", "content": self.system_message, "timestamp": date_str()}]
+        self.trace = [{"role": "system", "content": "You are a helpful assistant.", "timestamp": date_str()}]
+        
+        self.activation_tracker = ActivationTracker(layers=[12, 16, 20, 24, 28], task=self.task, sample=self.sample["task_id"], track_full_hidden_states=True) if track_activation else None
 
     def get_num_turns(self, participant="assistant"):
         return sum(1 for msg in self.trace if msg["role"] == participant)
 
     def run(self, verbose=False, save_log=True):
         # Reasoning models (if using a local reasoning model, list its name below)
-        REASONING_MODEL_KEYWORDS = ("o1", "o3", "deepseek-r1", "qwq", "deepseek-r")
-        is_reasoning_model = any(kw in self.assistant_model.lower() for kw in REASONING_MODEL_KEYWORDS)
-        max_assistant_tokens = 10000 if is_reasoning_model else 1000
+        # REASONING_MODEL_KEYWORDS = ("o1", "o3", "deepseek-r1", "qwq", "deepseek-r")
+        # is_reasoning_model = any(kw in self.assistant_model.lower() for kw in REASONING_MODEL_KEYWORDS)
+        # max_assistant_tokens = 10000 if is_reasoning_model else 1000
+        max_assistant_tokens = 10000
 
         is_completed, is_correct, score = False, False, None
         shards = self.sample["shards"]
@@ -81,7 +87,8 @@ class ConversationSimulatorSharded:
                 if verbose:
                     print_colored(f"[log] all shards revealed ({revealed_shard_ids} / {len(shards)})", "blue")
                 break
-
+            
+            is_first_turn = self.get_num_turns("assistant") == 0
             is_last_turn = len(revealed_shard_ids) == len(shards) - 1
 
             # 1. User response
@@ -100,12 +107,16 @@ class ConversationSimulatorSharded:
 
             # 2. Assistant response  ← uses HF generate() instead of OpenAI
             assistant_response_obj = generate(
-                extract_conversation(self.trace, to_str=False),
+                messages=extract_conversation(self.trace, to_str=False),
                 model=self.assistant_model,
                 temperature=self.assistant_temperature,
                 return_metadata=True,
                 max_tokens=max_assistant_tokens,
                 backend=self.hf_backend,
+                
+                is_first_turn=is_first_turn,
+                is_last_turn=is_last_turn,
+                activation_tracker=self.activation_tracker,
             )
             
             assistant_response = assistant_response_obj["message"]
@@ -149,17 +160,25 @@ class ConversationSimulatorSharded:
 
             elif system_verification_response["response_type"] in ["clarification", "discussion"]:
                 continue
-
+            
         if save_log:
-            conv_type = "sharded-hf"
+            conv_type = "sharded"
             if self.run_with_custom_temperature:
-                conv_type = f"sharded-hf-at{self.assistant_temperature}-ut{self.user_temperature}"
-            log_conversation(
+                conv_type = f"sharded-at{self.assistant_temperature}-ut{self.user_temperature}"
+            activation_result = self.activation_tracker.generate_result() if self.activation_tracker else None
+            conv_id = log_conversation(
                 conv_type, self.task.get_task_name(), self.sample["task_id"],
                 self.dataset_fn, self.assistant_model, self.system_model,
-                self.user_model, self.trace, is_correct, score,
+                self.user_model, self.trace, activation_result, is_correct, score,
                 log_folder=self.log_folder,
             )
+            # 同步保存 hidden states
+            if self.activation_tracker:
+                save_conversation_hidden_states(
+                    conv_id, conv_type, self.task.get_task_name(),
+                    self.assistant_model, self.activation_tracker,
+                    log_folder=self.log_folder
+                )
         return is_correct, score
 
 
@@ -182,6 +201,9 @@ if __name__ == "__main__":
                         help="HF backend: 'local' (transformers) or 'api' (HF Inference API). "
                              "Overrides HF_BACKEND env var.")
     parser.add_argument("--dataset", type=str, default="data/sharded_instructions_600.json")
+    
+    parser.add_argument("--track_activation", default=True, help="Whether to track activations (for local models only)")
+    
     args = parser.parse_args()
 
     # Set backend via env var so UserAgent / SystemAgent also pick it up if they call generate()
@@ -192,21 +214,22 @@ if __name__ == "__main__":
         data = json.load(f)
 
     # data = [d for d in data if d["task"] == args.task]
-    data = [d for d in data if d["task"] == args.task and d["task_id"] == "sharded-GSM8K/435"]
-    if not data:
-        raise ValueError(f"No samples found for task='{args.task}' in {args.dataset}")
+    data = [d for d in data if d["task"] == args.task]
+    
+    for i in range(15):
+        count = [d for d in data if len(d["shards"]) == i]  # TEMP: only test on 3-shard tasks for now
+        print(f"Tasks with {i} shards: {len(count)}")
 
-    sample = random.choice(data)
-    print(f"[main] Running task='{args.task}', sample id='{sample.get('task_id', '?')}'")
-    print(f"[main] Backend: {os.environ.get('HF_BACKEND', 'local')}")
+    # sample = random.choice(data)
+    # print(f"[main] Running task='{args.task}', sample id='{sample.get('task_id', '?')}'")
 
-    simulator = ConversationSimulatorSharded(
-        sample=sample,
-        assistant_model=args.assistant_model,
-        system_model=args.system_model,
-        user_model=args.user_model,
-        dataset_fn=args.dataset,
-        hf_backend=args.backend,
-    )
-    is_correct, score = simulator.run(verbose=True, save_log=True)
-    print(f"\n[main] Done. is_correct={is_correct}, score={score}")
+    # simulator = ConversationSimulatorSharded(
+    #     sample=sample,
+    #     assistant_model=args.assistant_model,
+    #     system_model=args.system_model,
+    #     user_model=args.user_model,
+    #     dataset_fn=args.dataset,
+    #     hf_backend=args.backend,
+    #     track_activation=args.track_activation,
+    # )
+    # is_correct, score = simulator.run(verbose=True, save_log=True)

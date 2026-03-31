@@ -6,6 +6,9 @@ import pandas as pd
 from bson.objectid import ObjectId
 from collections import Counter
 from datetime import datetime
+import torch
+from tasks.math.task_math import TaskMath
+from torch.serialization import add_safe_globals
 
 
 def get_log_files(conv_type, task_name, assistant_model, force_create=False, log_folder="logs"):
@@ -57,7 +60,7 @@ def get_run_counts(conv_type, task_name, assistant_model, dataset_fn, log_folder
     return task_id_counts
 
 
-def log_conversation(conv_type, task_name, task_id, dataset_fn, assistant_model, system_model, user_model, trace, is_correct=None, score=None, additional_info={}, log_folder=None):
+def log_conversation(conv_type, task_name, task_id, dataset_fn, assistant_model, system_model, user_model, trace, activation_result=None, is_correct=None, score=None, additional_info={}, log_folder=None):
     log_files = get_log_files(conv_type, task_name, assistant_model, force_create=True, log_folder=log_folder)
     log_file = log_files[-1]
 
@@ -69,10 +72,13 @@ def log_conversation(conv_type, task_name, task_id, dataset_fn, assistant_model,
 
     git_version = git.Repo(search_parent_directories=True).head.object.hexsha
 
-    record = {"conv_id": str(ObjectId()), "conv_type": conv_type, "task": task_name, "task_id": task_id, "dataset_fn": dataset_fn, "assistant_model": assistant_model, "system_model": system_model, "user_model": user_model, "git_version": git_version, "trace": trace, "is_correct": is_correct, "score": score} # , "source_conv_id": source_conv_id
+    conv_id = str(ObjectId())
+    record = {"conv_id": conv_id, "conv_type": conv_type, "task": task_name, "task_id": task_id, "dataset_fn": dataset_fn, "assistant_model": assistant_model, "system_model": system_model, "user_model": user_model, "git_version": git_version, "trace": trace, "activation_result": activation_result, "is_correct": is_correct, "score": score} # , "source_conv_id": source_conv_id
     record.update(additional_info) # sample-specific, for example for recap
     with open(log_file, "a") as f:
         f.write(json.dumps(record)+"\n")
+    
+    return conv_id
 
 
 def clean_model_name(model):
@@ -231,3 +237,128 @@ def split_files_in_folder(folder):
     for fn in os.listdir(folder):
         if fn.endswith(".jsonl"):
             split_large_file(os.path.join(folder, fn))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Hidden States Logging & Aggregation
+# ══════════════════════════════════════════════════════════════════════════════
+
+def save_conversation_hidden_states(conv_id, conv_type, task_name, assistant_model, activation_tracker, log_folder="logs"):
+	"""
+	保存单个 conversation 的 hidden states 到磁盘。
+	
+	路径结构（与日志保持平行）：
+	  logs/hidden_states/{task}/{conv_type}_{task}_{model}/{conv_id}.pt
+	
+	Args:
+	  conv_id: conversation 的唯一标识
+	  conv_type: conversation 类型 (e.g., "sharded-at0-ut0")
+	  task_name: 任务名 (e.g., "math")
+	  assistant_model: 模型名
+	  activation_tracker: ActivationTracker 实例（已记录 hidden states）
+	  log_folder: 日志根目录
+	"""
+	if activation_tracker is None or not activation_tracker.track_full_hidden_states:
+		return
+	
+	# 构建保存路径，镜像日志结构
+	sanitized_model = assistant_model
+	for char in ['<', '>', ':', '"', '/', '\\', '|', '?', '*']:
+		sanitized_model = sanitized_model.replace(char, '_')
+	
+	# 路径格式：logs/hidden_states/{task}/{conv_type}_{task}_{model}/
+	hidden_states_dir = f"{log_folder}/hidden_states/{task_name}/{conv_type}_{task_name}_{sanitized_model}"
+	os.makedirs(hidden_states_dir, exist_ok=True)
+	
+	filepath = os.path.join(hidden_states_dir, f"{conv_id}.pt")
+	activation_tracker.save_hidden_states(filepath)
+
+
+def aggregate_hidden_states_from_folder(folder, output_folder="logs/hidden_states_aggregated", force=False):
+    """
+    从指定文件夹中所有 .pt 文件聚合 hidden states。
+
+    用法：
+      aggregate_hidden_states_from_folder(
+        "logs/hidden_states/math/sharded-at0-ut0_math_meta-llama_Meta-Llama-3-8B-Instruct"
+      )
+
+    输出：
+      logs/hidden_states_aggregated/{task}/{conv_type}_{task}_{model}_aggregated.npz
+      包含 goal_mean, goal_std, turn_0_mean, turn_0_std, ... 等统计量
+    """
+    import numpy as np
+    from pathlib import Path
+    from collections import defaultdict
+
+    folder_path = Path(folder)
+    if not folder_path.exists():
+        print(f"⚠️ Folder not found: {folder}")
+        return
+
+    # 从路径推断任务和配置信息
+    # 路径格式：logs/hidden_states/{task}/{conv_type}_{task}_{model}
+    parts = str(folder_path).split("/")
+    if len(parts) < 3:
+        print("⚠️ Invalid folder path structure")
+        return
+
+    task_name = parts[-2]
+    config_name = parts[-1]
+
+    # 收集所有 hidden states
+    records_by_turn = defaultdict(list)  # {turn_label: [(num_layers, D), ...]}
+    num_files = 0
+
+    for pt_file in folder_path.glob("*.pt"):
+        try:
+            # 每个 .pt 文件包含一个 conversation 的所有 hidden states
+            import torch
+
+            # try:
+            #     data = torch.load(pt_file, map_location="cpu", weights_only=False)
+            # except TypeError:
+            #     # 兼容旧版 torch（不支持 weights_only 参数）
+            #     data = torch.load(pt_file, map_location="cpu")
+            
+            add_safe_globals([TaskMath])
+            data = torch.load(pt_file, map_location="cpu", weights_only=True)
+            
+            hidden_states_list = data["hidden_states"]  # [{"label": "goal"/"turn_i", "hidden_states": tensor}, ...]
+
+            for entry in hidden_states_list:
+                label = entry["label"]
+                hs = entry["hidden_states"]  # (num_layers, D)
+                records_by_turn[label].append(hs.numpy() if torch.is_tensor(hs) else hs)
+
+            num_files += 1
+        except Exception as e:
+            print(f"⚠️ Error reading {pt_file.name}: {e}")
+
+    if not records_by_turn:
+        print(f"⚠️ No hidden states records found in {folder}")
+        return
+
+    # 计算每个 turn 的汇总统计
+    os.makedirs(output_folder, exist_ok=True)
+    output_file = os.path.join(output_folder, f"{config_name}_aggregated.npz")
+
+    aggregate = {
+        "task": np.array([task_name], dtype=object),
+        "num_conversations": np.array([num_files]),
+        "num_turns": np.array([len(records_by_turn)]),
+    }
+
+    for turn_label in sorted(records_by_turn.keys()):
+        states_list = records_by_turn[turn_label]
+        if states_list:
+            stacked = np.stack(states_list, axis=0)  # (num_conversations, num_layers, D)
+            aggregate[f"{turn_label}_mean"] = np.mean(stacked, axis=0)
+            aggregate[f"{turn_label}_std"] = np.std(stacked, axis=0)
+            aggregate[f"{turn_label}_count"] = np.array([len(states_list)])
+
+    np.savez_compressed(output_file, **aggregate)
+    print(f"✅ Aggregated {num_files} hidden states files -> {output_file}")
+    print(f"   Turns found: {sorted(records_by_turn.keys())}")
+
+    return output_file

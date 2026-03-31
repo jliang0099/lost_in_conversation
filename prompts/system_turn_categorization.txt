@@ -15,7 +15,7 @@ You must classify the response of the assistant according to the response type:
 - `refuse`: The response contains an explicit or implicit refusal to answer the user's question without a follow-up question or a request.
 - `missing`: The response is empty/blank.
 
-You must output your answer in the following JSON format:
+You must output ONLY a JSON object in the following format, with no additional text:
 {"response_type": "refuse|missing|answer_attempt|hedge|clarification|interrogation|discussion"}
 
 Rules:

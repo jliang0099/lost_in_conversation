@@ -26,12 +26,19 @@ import re
 import json
 import time
 from typing import Optional
+import torch
+from activation_tracker import ActivationTracker
 
 # ── env config ────────────────────────────────────────────────────────────────
 HF_BACKEND   = os.environ.get("HF_BACKEND",   "local")
 HF_API_TOKEN = os.environ.get("HF_API_TOKEN", "")
 
 DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+
+GOAL_ELICITING_SUFFIX = (
+    "Given the conversation so far, complete this sentence in one line:\n"
+    '"The question I am ultimately trying to answer is: "'
+)
 
 
 # ── prompt formatting (identical to original) ─────────────────────────────────
@@ -56,27 +63,25 @@ def format_messages(messages: list[dict], variables: dict = {}) -> list[dict]:
 
 # ── local backend helpers ─────────────────────────────────────────────────────
 
-_pipeline_cache: dict = {}
+_model_cache: dict = {}
 
-
-def _get_local_pipeline(model_name: str):
-    """Load (and cache) a transformers text-generation pipeline."""
-    if model_name not in _pipeline_cache:
-        from transformers import pipeline, AutoTokenizer
+def _get_local_model(model_name: str):
+    """Load (and cache) model + tokenizer directly — NOT via pipeline."""
+    if model_name not in _model_cache:
+        from transformers import AutoTokenizer, AutoModelForCausalLM
         import torch
 
         print(f"[HF-local] Loading '{model_name}' …")
         tokenizer = AutoTokenizer.from_pretrained(model_name)
-        pipe = pipeline(
-            "text-generation",
-            model=model_name,
-            tokenizer=tokenizer,
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
             torch_dtype=torch.float16,
             device_map="auto",
         )
-        _pipeline_cache[model_name] = pipe
+        model.eval()
+        _model_cache[model_name] = (model, tokenizer)
         print(f"[HF-local] '{model_name}' ready.")
-    return _pipeline_cache[model_name]
+    return _model_cache[model_name]
 
 
 def _apply_chat_template(messages: list[dict], tokenizer) -> str:
@@ -105,6 +110,22 @@ def _sanitize_messages_local(messages: list[dict]) -> list[dict]:
     return messages
 
 
+def _build_goal_eliciting_messages(messages: list[dict]) -> list[dict]:
+    """Append a short goal-eliciting suffix to the final user input for prefill only."""
+    goal_messages = list(messages)
+
+    for i in range(len(goal_messages) - 1, -1, -1):
+        if goal_messages[i]["role"] == "user":
+            goal_messages[i] = {
+                **goal_messages[i],
+                "content": f"{goal_messages[i]['content']}\n\n{GOAL_ELICITING_SUFFIX}",
+            }
+            return goal_messages
+
+    goal_messages.append({"role": "user", "content": GOAL_ELICITING_SUFFIX})
+    return goal_messages
+
+
 # ── HF Model class ────────────────────────────────────────────────────────────
 
 class HF_Model:
@@ -112,82 +133,75 @@ class HF_Model:
         self.backend = backend or HF_BACKEND
 
     # ── internal generation ────────────────────────────────────────────────
-
     def _generate_local(
         self,
         messages: list[dict],
-        model: str,
+        model_name: str,
         temperature: float,
         max_tokens: int,
+        is_first_turn: bool,
+        is_last_turn: bool,
+        activation_tracker=None
     ) -> dict:
-        pipe = _get_local_pipeline(model)
-        tokenizer = pipe.tokenizer
+
+        model, tokenizer = _get_local_model(model_name)
         msgs = _sanitize_messages_local(messages)
         prompt = _apply_chat_template(msgs, tokenizer)
 
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
         t0 = time.time()
-        outputs = pipe(
-            prompt,
-            max_new_tokens=max_tokens,
-            temperature=max(temperature, 1e-5),
-            do_sample=temperature > 0.01,
-            return_full_text=False,
-            pad_token_id=tokenizer.eos_token_id,
-        )
+        
+        # ── 第1步：prefill，采样"理解状态" ──────────────────────────────────
+        # 只在需要 tracker 时才跑这一步，避免多余开销
+        if activation_tracker is not None:
+            # goal_msgs = _build_goal_eliciting_messages(msgs)
+            # goal_prompt = _apply_chat_template(goal_msgs, tokenizer)
+            # goal_inputs = tokenizer(goal_prompt, return_tensors="pt").to(model.device)
+
+            with torch.no_grad():
+                prefill_out = model(
+                    **inputs,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+            # prefill_out.hidden_states: tuple[layer] of (batch, seq_len, hidden)
+            # 取最后一个输入 token 的表征 → 代表"模型读完整个对话后的理解"
+            hs = list(prefill_out.hidden_states)  # list[layer] of (1, seq_len, hidden)
+
+            if is_first_turn:
+                activation_tracker.set_goal(hs)
+            else:
+                activation_tracker.record_activation(hs)
+                
+        # ── 第2步：正常生成，不需要 hidden states ───────────────────────────
+        # do_sample = temperature > 0.01
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_tokens,
+                temperature=0.1,  # 固定低温，保持输出稳定；实际温度控制在 prefill 阶段
+                # do_sample=do_sample,
+                pad_token_id=tokenizer.eos_token_id,
+                return_dict_in_generate=True,
+                # output_hidden_states 不再需要
+            )
+        
         elapsed = time.time() - t0
 
-        text = outputs[0]["generated_text"].strip()
-        approx_tokens = len(text.split())
+        # 只取新生成的 token（去掉 prompt 部分）
+        input_len = inputs["input_ids"].shape[1]
+        generated_ids = outputs.sequences[0][input_len:]
+        text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+
+        approx_tokens = len(generated_ids)
 
         return {
             "message": text,
             "total_tokens": approx_tokens,
-            "prompt_tokens": 0,       # not easily available from pipeline
+            "prompt_tokens": inputs["input_ids"].shape[1],
             "prompt_tokens_cached": 0,
             "completion_tokens": approx_tokens,
-            "total_usd": 0.0,         # local = free
-            "elapsed_sec": elapsed,
-        }
-
-    def _generate_api(
-        self,
-        messages: list[dict],
-        model: str,
-        temperature: float,
-        max_tokens: int,
-        is_json: bool,
-    ) -> dict:
-        from huggingface_hub import InferenceClient
-
-        client = InferenceClient(token=HF_API_TOKEN or None)
-
-        kwargs = {}
-        if is_json:
-            # Some HF endpoints support grammar-based JSON mode
-            kwargs["response_format"] = {"type": "json_object"}
-
-        t0 = time.time()
-        response = client.chat_completion(
-            model=model,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=max(temperature, 0.01),
-            **kwargs,
-        )
-        elapsed = time.time() - t0
-
-        text = response.choices[0].message.content.strip()
-        usage = getattr(response, "usage", None)
-        total_tokens      = getattr(usage, "total_tokens",      0) if usage else 0
-        prompt_tokens     = getattr(usage, "prompt_tokens",     0) if usage else 0
-        completion_tokens = getattr(usage, "completion_tokens", 0) if usage else 0
-
-        return {
-            "message": text,
-            "total_tokens": total_tokens,
-            "prompt_tokens": prompt_tokens,
-            "prompt_tokens_cached": 0,
-            "completion_tokens": completion_tokens,
             "total_usd": 0.0,
             "elapsed_sec": elapsed,
         }
@@ -206,6 +220,11 @@ class HF_Model:
         max_tokens: Optional[int] = None,
         variables: dict = {},
         backend: Optional[str] = None,  # per-call override
+        
+        is_first_turn: Optional[bool] = None,  # custom kwarg for simulator
+        is_last_turn: Optional[bool] = None,   # custom kwarg for simulator
+        activation_tracker=None,  # custom kwarg for simulator
+        
     ) -> str | dict:
         """
         Drop-in replacement for OpenAI_Model.generate().
@@ -215,6 +234,7 @@ class HF_Model:
             dict  if return_metadata=True  →  same keys as original
         """
         messages = format_messages(list(messages), variables)  # don't mutate caller's list
+        
         effective_backend = backend or self.backend
         max_tokens = max_tokens or 1000
 
@@ -223,7 +243,7 @@ class HF_Model:
                 if effective_backend == "api":
                     result = self._generate_api(messages, model, temperature, max_tokens, is_json)
                 else:
-                    result = self._generate_local(messages, model, temperature, max_tokens)
+                    result = self._generate_local(messages, model, temperature, max_tokens, is_first_turn, is_last_turn, activation_tracker)
                 break
             except Exception as e:
                 if attempt >= max_retries - 1:
