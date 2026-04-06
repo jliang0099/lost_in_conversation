@@ -35,10 +35,10 @@ HF_API_TOKEN = os.environ.get("HF_API_TOKEN", "")
 
 DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 
-GOAL_ELICITING_SUFFIX = (
-    "Given the conversation so far, complete this sentence in one line:\n"
-    '"The question I am ultimately trying to answer is: "'
-)
+# GOAL_ELICITING_SUFFIX = (
+#     "Given the conversation so far, complete this sentence in one line:\n"
+#     '"The question I am ultimately trying to answer is: "'
+# )
 
 
 # ── prompt formatting (identical to original) ─────────────────────────────────
@@ -96,34 +96,34 @@ def _apply_chat_template(messages: list[dict], tokenizer) -> str:
     return "\n".join(parts)
 
 
-def _sanitize_messages_local(messages: list[dict]) -> list[dict]:
-    """
-    Some open models don't support a leading system message.
-    Merge it into the first user message when that's the case.
-    (Optional — remove if your model handles system messages fine.)
-    """
-    if messages and messages[0]["role"] == "system" and len(messages) > 1 and messages[1]["role"] == "user":
-        sys_content = messages[0]["content"]
-        messages = list(messages)  # don't mutate original
-        messages[1] = {**messages[1], "content": f"[System]: {sys_content}\n{messages[1]['content']}"}
-        messages = messages[1:]
-    return messages
+# def _sanitize_messages_local(messages: list[dict]) -> list[dict]:
+#     """
+#     Some open models don't support a leading system message.
+#     Merge it into the first user message when that's the case.
+#     (Optional — remove if your model handles system messages fine.)
+#     """
+#     if messages and messages[0]["role"] == "system" and len(messages) > 1 and messages[1]["role"] == "user":
+#         sys_content = messages[0]["content"]
+#         messages = list(messages)  # don't mutate original
+#         messages[1] = {**messages[1], "content": f"[System]: {sys_content}\n{messages[1]['content']}"}
+#         messages = messages[1:]
+#     return messages
 
 
-def _build_goal_eliciting_messages(messages: list[dict]) -> list[dict]:
-    """Append a short goal-eliciting suffix to the final user input for prefill only."""
-    goal_messages = list(messages)
+# def _build_goal_eliciting_messages(messages: list[dict]) -> list[dict]:
+#     """Append a short goal-eliciting suffix to the final user input for prefill only."""
+#     goal_messages = list(messages)
 
-    for i in range(len(goal_messages) - 1, -1, -1):
-        if goal_messages[i]["role"] == "user":
-            goal_messages[i] = {
-                **goal_messages[i],
-                "content": f"{goal_messages[i]['content']}\n\n{GOAL_ELICITING_SUFFIX}",
-            }
-            return goal_messages
+#     for i in range(len(goal_messages) - 1, -1, -1):
+#         if goal_messages[i]["role"] == "user":
+#             goal_messages[i] = {
+#                 **goal_messages[i],
+#                 "content": f"{goal_messages[i]['content']}\n\n{GOAL_ELICITING_SUFFIX}",
+#             }
+#             return goal_messages
 
-    goal_messages.append({"role": "user", "content": GOAL_ELICITING_SUFFIX})
-    return goal_messages
+#     goal_messages.append({"role": "user", "content": GOAL_ELICITING_SUFFIX})
+#     return goal_messages
 
 
 # ── HF Model class ────────────────────────────────────────────────────────────
@@ -145,11 +145,10 @@ class HF_Model:
     ) -> dict:
 
         model, tokenizer = _get_local_model(model_name)
-        msgs = _sanitize_messages_local(messages)
-        prompt = _apply_chat_template(msgs, tokenizer)
-
+        # msgs = _sanitize_messages_local(messages)
+        
+        prompt = _apply_chat_template(messages, tokenizer)
         inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-
         t0 = time.time()
         
         # ── 第1步：prefill，采样"理解状态" ──────────────────────────────────
@@ -193,7 +192,6 @@ class HF_Model:
         input_len = inputs["input_ids"].shape[1]
         generated_ids = outputs.sequences[0][input_len:]
         text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-
         approx_tokens = len(generated_ids)
 
         return {

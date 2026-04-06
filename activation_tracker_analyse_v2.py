@@ -22,12 +22,10 @@ from sklearn.metrics import roc_auc_score
 
 # ── 配置 ──────────────────────────────────────────────────────────────────────
 PT_DIR = Path(
-    "/home/jie/projects/lost_in_conversation/logs/hidden_states/math"
-    "/sharded-at0-ut0_math_meta-llama_Llama-3.1-8B-Instruct"
+    "logs/hidden_states/math/sharded-at0-ut0_math_meta-llama_Llama-3.1-8B-Instruct"
 )
 JSONL_PATH = Path(
-    "/home/jie/projects/lost_in_conversation/logs/math/sharded-at0-ut0"
-    "/sharded-at0-ut0_math_meta-llama_Llama-3.1-8B-Instruct.jsonl"
+    "logs/math/sharded-at0-ut0/sharded-at0-ut0_math_meta-llama_Llama-3.1-8B-Instruct.jsonl"
 )
 LAYERS = [12, 16, 20, 24, 28]
 OUTPUT_DIR = PT_DIR.parent / "temporal_cosine_analysis_v2"

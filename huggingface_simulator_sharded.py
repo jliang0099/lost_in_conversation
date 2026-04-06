@@ -77,7 +77,7 @@ class ConversationSimulatorSharded:
         is_completed, is_correct, score = False, False, None
         shards = self.sample["shards"]
 
-        while not is_completed:
+        while not is_completed:         
             revealed_shard_ids = set(
                 [msg["content"]["shard_id"] for msg in self.trace
                  if msg["role"] == "log" and msg["content"]["type"] == "shard_revealed"]

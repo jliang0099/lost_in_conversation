@@ -44,7 +44,7 @@ if __name__ == '__main__':
     parser.add_argument("--N_sharded_runs", type=int, default=1, help="Number of sharded runs per model")
     parser.add_argument("--models", nargs="+", default=["meta-llama/Llama-3.1-8B-Instruct"], # `, "gpt-4o"`
                         help="List of models to run experiments with")
-    parser.add_argument("--tasks", nargs="+", default=["actions"], help="Tasks to run experiments with") # "code", "database", "actions", "math", "data2text", "summary", "translation"
+    parser.add_argument("--tasks", nargs="+", default=["math"], help="Tasks to run experiments with") # "code", "database", "actions", "math", "data2text", "summary", "translation"
     parser.add_argument("--system_model", type=str, default="meta-llama/Llama-3.1-8B-Instruct", help="System model to use")
     parser.add_argument("--user_model", type=str, default="meta-llama/Llama-3.1-8B-Instruct", help="User model to use")
     parser.add_argument("--N_workers", type=int, default=1, help="Number of workers to run experiments with")
@@ -64,6 +64,8 @@ if __name__ == '__main__':
 
     with open(dataset_fn, "r") as f:
         samples = json.load(f)
+        
+    # samples = samples[:300] # for testing
 
     samples = [d for d in samples if d["task"] in args.tasks]
 

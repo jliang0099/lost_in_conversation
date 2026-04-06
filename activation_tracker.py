@@ -160,77 +160,77 @@ class ActivationTracker:
 		else:
 			raise ValueError(f"Unsupported format: {filepath.suffix}. Use .pt, .pth, or .npz")
 
-	@staticmethod
-	def aggregate_hidden_states_from_jsonl(jsonl_filepath: str | Path, output_filepath: str | Path) -> dict:
-		"""
-		从 JSONL 日志文件中聚合所有 conversations 的 hidden states。
+	# @staticmethod
+	# def aggregate_hidden_states_from_jsonl(jsonl_filepath: str | Path, output_filepath: str | Path) -> dict:
+	# 	"""
+	# 	从 JSONL 日志文件中聚合所有 conversations 的 hidden states。
 		
-		用法：
-		  ActivationTracker.aggregate_hidden_states_from_jsonl(
-		    "logs/math/sharded-at0-ut0_math_meta-llama_Meta-Llama-3-8B-Instruct.jsonl",
-		    "logs/hidden_states/math/sharded-at0-ut0_math_meta-llama_Meta-Llama-3-8B-Instruct_aggregated.npz"
-		  )
+	# 	用法：
+	# 	  ActivationTracker.aggregate_hidden_states_from_jsonl(
+	# 	    "logs/math/sharded-at0-ut0_math_meta-llama_Meta-Llama-3-8B-Instruct.jsonl",
+	# 	    "logs/hidden_states/math/sharded-at0-ut0_math_meta-llama_Meta-Llama-3-8B-Instruct_aggregated.npz"
+	# 	  )
 		
-		输出 .npz 包含：
-		  - 按 turn 聚合的均值张量: goal_mean, turn_0_mean, turn_1_mean, ...
-		  - 对应的标准差: goal_std, turn_0_std, ...
-		  - 元数据: task, num_conversations, num_turns, layers
-		"""
-		import json
-		from collections import defaultdict
+	# 	输出 .npz 包含：
+	# 	  - 按 turn 聚合的均值张量: goal_mean, turn_0_mean, turn_1_mean, ...
+	# 	  - 对应的标准差: goal_std, turn_0_std, ...
+	# 	  - 元数据: task, num_conversations, num_turns, layers
+	# 	"""
+	# 	import json
+	# 	from collections import defaultdict
 		
-		jsonl_path = Path(jsonl_filepath)
-		output_path = Path(output_filepath)
-		output_path.parent.mkdir(parents=True, exist_ok=True)
+	# 	jsonl_path = Path(jsonl_filepath)
+	# 	output_path = Path(output_filepath)
+	# 	output_path.parent.mkdir(parents=True, exist_ok=True)
 		
-		# 读取 JSONL，收集所有 hidden states 记录
-		records_by_turn = defaultdict(list)  # {turn_label: [(num_layers, D), ...]}
-		metadata = {}
-		num_valid = 0
+	# 	# 读取 JSONL，收集所有 hidden states 记录
+	# 	records_by_turn = defaultdict(list)  # {turn_label: [(num_layers, D), ...]}
+	# 	metadata = {}
+	# 	num_valid = 0
 		
-		with open(jsonl_path, 'r') as f:
-			for line in f:
-				if not line.strip():
-					continue
-				try:
-					record = json.loads(line)
-					# 假设该记录中存有 hidden_states_path 或直接的 hidden_states
-					# 这里需要你在日志保存时也记录 hidden_states 路径或数据
-					# 简单版本：去掉这个方法，改为在保存后直接聚合
-				except:
-					pass
+	# 	with open(jsonl_path, 'r') as f:
+	# 		for line in f:
+	# 			if not line.strip():
+	# 				continue
+	# 			try:
+	# 				record = json.loads(line)
+	# 				# 假设该记录中存有 hidden_states_path 或直接的 hidden_states
+	# 				# 这里需要你在日志保存时也记录 hidden_states 路径或数据
+	# 				# 简单版本：去掉这个方法，改为在保存后直接聚合
+	# 			except:
+	# 				pass
 		
-		if not records_by_turn:
-			print("⚠️ No hidden states records found in JSONL")
-			return {}
+	# 	if not records_by_turn:
+	# 		print("⚠️ No hidden states records found in JSONL")
+	# 		return {}
 		
-		# 计算每个 turn 的汇总统计
-		aggregate = {"task": metadata.get("task"), "num_conversations": num_valid}
-		for turn_label, states_list in records_by_turn.items():
-			if states_list:
-				# states_list: [(num_layers, D), ...]
-				stacked = np.stack(states_list, axis=0)  # (num_conversations, num_layers, D)
-				aggregate[f"{turn_label}_mean"] = np.mean(stacked, axis=0)
-				aggregate[f"{turn_label}_std"] = np.std(stacked, axis=0)
+	# 	# 计算每个 turn 的汇总统计
+	# 	aggregate = {"task": metadata.get("task"), "num_conversations": num_valid}
+	# 	for turn_label, states_list in records_by_turn.items():
+	# 		if states_list:
+	# 			# states_list: [(num_layers, D), ...]
+	# 			stacked = np.stack(states_list, axis=0)  # (num_conversations, num_layers, D)
+	# 			aggregate[f"{turn_label}_mean"] = np.mean(stacked, axis=0)
+	# 			aggregate[f"{turn_label}_std"] = np.std(stacked, axis=0)
 		
-		np.savez_compressed(output_path, **aggregate)
-		print(f"✅ Aggregated hidden states -> {output_path}")
-		return aggregate
+	# 	np.savez_compressed(output_path, **aggregate)
+	# 	print(f"✅ Aggregated hidden states -> {output_path}")
+	# 	return aggregate
 
-	def get_hidden_states_summary(self) -> dict:
-		"""获取 hidden states 的元数据摘要。"""
-		summary = {
-			"track_enabled": self.track_full_hidden_states,
-			"num_records": len(self.final_hidden_states_history),
-			"layers": self.layers,
-		}
-		if self.final_hidden_states_history:
-			summary["records"] = [
-				{
-					"label": entry["label"],
-					"shape": tuple(entry["hidden_states"].shape),  # (num_layers, D)
-					"size_mb": entry["hidden_states"].element_size() * entry["hidden_states"].nelement() / 1e6,
-				}
-				for entry in self.final_hidden_states_history
-			]
-		return summary
+	# def get_hidden_states_summary(self) -> dict:
+	# 	"""获取 hidden states 的元数据摘要。"""
+	# 	summary = {
+	# 		"track_enabled": self.track_full_hidden_states,
+	# 		"num_records": len(self.final_hidden_states_history),
+	# 		"layers": self.layers,
+	# 	}
+	# 	if self.final_hidden_states_history:
+	# 		summary["records"] = [
+	# 			{
+	# 				"label": entry["label"],
+	# 				"shape": tuple(entry["hidden_states"].shape),  # (num_layers, D)
+	# 				"size_mb": entry["hidden_states"].element_size() * entry["hidden_states"].nelement() / 1e6,
+	# 			}
+	# 			for entry in self.final_hidden_states_history
+	# 		]
+	# 	return summary
