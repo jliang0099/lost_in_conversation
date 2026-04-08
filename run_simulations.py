@@ -37,7 +37,7 @@ if __name__ == '__main__':
     multiprocessing.freeze_support()
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--dataset_file", type=str, default="data/sharded_instructions_600.json", help="Dataset file to use")
+    parser.add_argument("--dataset_file", type=str, default="data/(v2)sharded_gsm8k.json", help="Dataset file to use")
 
     parser.add_argument("--N_full_runs", type=int, default=1, help="Number of full runs per model")
     parser.add_argument("--N_concat_runs", type=int, default=1, help="Number of concat runs per model")
@@ -64,10 +64,10 @@ if __name__ == '__main__':
 
     with open(dataset_fn, "r") as f:
         samples = json.load(f)
-        
-    # samples = samples[:300] # for testing
 
     samples = [d for d in samples if d["task"] in args.tasks]
+    
+    samples = [sample for sample in samples if len(sample["shards"]) >= 6]
 
     print(f"Loaded {len(samples)} samples")
     random.shuffle(samples)

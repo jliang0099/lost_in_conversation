@@ -1,5 +1,5 @@
 """
-Temporal geometry analysis for hidden states (v2).
+Temporal geometry analysis for hidden states (v3).
 
 Changes from v1:
 - Only analyze turns 3–8 (turn_idx <= 8)
@@ -22,18 +22,29 @@ from sklearn.metrics import roc_auc_score
 
 # ── 配置 ──────────────────────────────────────────────────────────────────────
 PT_DIR = Path(
+    "logs/hidden_states/math/(specific system prompt+no suffix)sharded-at0-ut0_math_meta-llama_Llama-3.1-8B-Instruct"
+)
+PT_DIR_ADD = Path(
     "logs/hidden_states/math/sharded-at0-ut0_math_meta-llama_Llama-3.1-8B-Instruct"
 )
 JSONL_PATH = Path(
+    "logs/math/sharded-at0-ut0/(specific system prompt+no suffix)sharded-at0-ut0_math_meta-llama_Llama-3.1-8B-Instruct.jsonl"
+)
+JSONL_PATH_ADD = Path(
     "logs/math/sharded-at0-ut0/sharded-at0-ut0_math_meta-llama_Llama-3.1-8B-Instruct.jsonl"
 )
+
+PT_SOURCES = [PT_DIR, PT_DIR_ADD]
+JSONL_SOURCES = [JSONL_PATH, JSONL_PATH_ADD]
+
 LAYERS = [12, 16, 20, 24, 28]
-OUTPUT_DIR = PT_DIR.parent / "temporal_cosine_analysis_v2"
+OUTPUT_DIR = PT_DIR.parent / "temporal_cosine_analysis_v3_merged"
 EPS = 1e-12
-MAX_TURN = 8 # only keep turn_3 … turn_8
+MAX_TURN = 8       # only keep turn_3 … turn_8
+FIX_TURN = 8       # for debugging: only analyze turn_3
 MIN_N    = 3       # minimum samples per class to plot a point
 N_BOOT   = 2000    # bootstrap resamples for CI
-CI       = 95      # confidence interval %
+CI       = 90      # confidence interval %
 
 # ── 工具函数 ──────────────────────────────────────────────────────────────────
 
@@ -86,97 +97,123 @@ def bootstrap_ci(values: np.ndarray, n_boot: int = N_BOOT, ci: float = CI):
     return float(lo), float(hi)
 
 
-# ── Step 1: 读取 JSONL ────────────────────────────────────────────────────────
-print(f"Reading scores from:\n  {JSONL_PATH}\n")
-score_map = {}
+# ── Step 1: 读取 JSONL（合并多来源）────────────────────────────────────────────
+print("Reading scores from sources:")
+for p in JSONL_SOURCES:
+    print(f"  - {p}")
+print()
 
-with open(JSONL_PATH, "r") as f:
-    for line in f:
-        line = line.strip()
-        if not line:
-            continue
-        rec = json.loads(line)
-        conv_id = rec.get("conv_id")
-        score   = rec.get("score")
-        # if score is None:
-        #     score = 0.0
-        is_correct = rec.get("is_correct")
-        print(conv_id, score, is_correct)
-        if conv_id is None or score is None:
-            continue
-        score_map[conv_id] = int(float(score))
+score_map = {}
+score_conflicts = 0
+
+for jsonl_path in JSONL_SOURCES:
+    loaded_this_file = 0
+    with open(jsonl_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            conv_id = rec.get("conv_id")
+            score   = rec.get("score")
+            if score is None:
+                score = 0.0
+            if conv_id is None or score is None:
+                continue
+
+            score_i = int(float(score))
+            if conv_id in score_map and score_map[conv_id] != score_i:
+                score_conflicts += 1
+            score_map[conv_id] = score_i
+            loaded_this_file += 1
+
+    print(f"  Loaded from {jsonl_path.name}: {loaded_this_file}")
 
 n_correct   = sum(v == 1 for v in score_map.values())
 n_incorrect = sum(v == 0 for v in score_map.values())
 print(f"  Total records : {len(score_map)}")
 print(f"  Correct       : {n_correct}")
 print(f"  Incorrect     : {n_incorrect}\n")
+if score_conflicts:
+    print(f"  Score conflicts (same conv_id, different score): {score_conflicts}\n")
 
-# ── Step 2: 收集指标（只保留 turn_idx <= MAX_TURN）────────────────────────────
-print(f"Loading .pt files from:\n  {PT_DIR}\n")
+# ── Step 2: 收集指标（只保留 turn_idx <= MAX_TURN，合并多来源）──────────────────
+print("Loading .pt files from sources:")
+for p in PT_SOURCES:
+    print(f"  - {p}")
+print()
 
 layer_data = {i: {} for i in range(len(LAYERS))}
 skipped_no_score  = 0
 skipped_no_goal   = 0
 skipped_short_turn = 0
+skipped_duplicate_conv = 0
+seen_conv_ids = set()
 
-for pt_file in sorted(PT_DIR.glob("*.pt")):
-    conv_id = pt_file.stem
-    if conv_id not in score_map:
-        skipped_no_score += 1
-        continue
+for pt_dir in PT_SOURCES:
+    for pt_file in sorted(pt_dir.glob("*.pt")):
+        conv_id = pt_file.stem
 
-    score = score_map[conv_id]
-    data  = torch.load(pt_file, map_location="cpu", weights_only=False)
-    hs_list    = data.get("hidden_states", [])
-    hs_by_label = {entry["label"]: entry["hidden_states"] for entry in hs_list}
+        if conv_id in seen_conv_ids:
+            skipped_duplicate_conv += 1
+            continue
+        seen_conv_ids.add(conv_id)
 
-    if "goal" not in hs_by_label:
-        skipped_no_goal += 1
-        continue
-
-    turn_labels = sorted(
-        [k for k in hs_by_label if k.startswith("turn_")],
-        key=turn_sort_key,
-    )
-    if len(turn_labels) < 2:
-        skipped_short_turn += 1
-        continue
-
-    goal_hs = hs_by_label["goal"]
-
-    for t_idx in range(2, len(turn_labels)):
-        turn_now = turn_labels[t_idx]
-        if turn_index(turn_now) > MAX_TURN:   # ← 关键过滤
+        if conv_id not in score_map:
+            skipped_no_score += 1
             continue
 
-        turn_prev2 = turn_labels[t_idx - 2]
-        turn_prev1 = turn_labels[t_idx - 1]
+        score = score_map[conv_id]
+        data  = torch.load(pt_file, map_location="cpu", weights_only=False)
+        hs_list    = data.get("hidden_states", [])
+        hs_by_label = {entry["label"]: entry["hidden_states"] for entry in hs_list}
 
-        hs_prev2 = hs_by_label[turn_prev2]
-        hs_prev1 = hs_by_label[turn_prev1]
-        hs_now   = hs_by_label[turn_now]
+        if "goal" not in hs_by_label:
+            skipped_no_goal += 1
+            continue
 
-        for i in range(len(LAYERS)):
-            vec_prev2 = hs_prev2[i].numpy()
-            vec_prev1 = hs_prev1[i].numpy()
-            vec_now   = hs_now[i].numpy()
-            vec_goal  = goal_hs[i].numpy()
+        turn_labels = sorted(
+            [k for k in hs_by_label if k.startswith("turn_")],
+            key=turn_sort_key,
+        )
+        if len(turn_labels) != 6:
+            skipped_short_turn += 1
+            continue
 
-            step_prev = vec_prev1 - vec_prev2
-            step_now  = vec_now  - vec_prev1
-            to_goal   = vec_goal - vec_prev1
+        goal_hs = hs_by_label["goal"]
 
-            cos_step = cosine_similarity(step_now, step_prev)
-            cos_goal = cosine_similarity(step_now, to_goal)
+        for t_idx in range(2, len(turn_labels)):
+            turn_now = turn_labels[t_idx]
+            if turn_index(turn_now) > MAX_TURN:   # ← 关键过滤
+                continue
 
-            store = layer_data[i].setdefault(
-                turn_now,
-                {"cos_step": [], "cos_goal": [], "label": []},
-            )
-            store["cos_step"].append(cos_step)
-            store["cos_goal"].append(cos_goal)
-            store["label"].append(score)
+            turn_prev2 = turn_labels[t_idx - 2]
+            turn_prev1 = turn_labels[t_idx - 1]
+
+            hs_prev2 = hs_by_label[turn_prev2]
+            hs_prev1 = hs_by_label[turn_prev1]
+            hs_now   = hs_by_label[turn_now]
+
+            for i in range(len(LAYERS)):
+                vec_prev2 = hs_prev2[i].numpy()
+                vec_prev1 = hs_prev1[i].numpy()
+                vec_now   = hs_now[i].numpy()
+                vec_goal  = goal_hs[i].numpy()
+
+                step_prev = vec_prev1 - vec_prev2
+                step_now  = vec_now  - vec_prev1
+                to_goal   = vec_goal - vec_prev1
+
+                cos_step = cosine_similarity(step_now, step_prev)
+                cos_goal = cosine_similarity(step_now, to_goal)
+
+                store = layer_data[i].setdefault(
+                    turn_now,
+                    {"cos_step": [], "cos_goal": [], "label": []},
+                )
+                store["cos_step"].append(cos_step)
+                store["cos_goal"].append(cos_goal)
+                store["label"].append(score)
 
 all_turns = sorted(layer_data[0].keys(), key=turn_sort_key)
 assert all_turns, "No valid turns found."
@@ -185,6 +222,7 @@ print(f"  Turn range analyzed : {all_turns[0]} – {all_turns[-1]}")
 if skipped_no_score:   print(f"  Skipped (no score)  : {skipped_no_score}")
 if skipped_no_goal:    print(f"  Skipped (no goal)   : {skipped_no_goal}")
 if skipped_short_turn: print(f"  Skipped (<3 turns)  : {skipped_short_turn}")
+if skipped_duplicate_conv: print(f"  Skipped (duplicate conv_id across dirs): {skipped_duplicate_conv}")
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -334,13 +372,13 @@ def plot_metric(metric_key: str, title: str, out_name: str):
 plot_metric(
     metric_key="cos_step",
     title="Temporal Curvature: cos(step_n, step_{n-1}) by correctness",
-    out_name="temporal_cos_step_by_turn_v2.png",
+    out_name="temporal_cos_step_by_turn_v3.png",
 )
 
 plot_metric(
     metric_key="cos_goal",
     title="Goal Progress: cos(step_n, goal − turn_{n-1}) by correctness",
-    out_name="temporal_cos_goal_by_turn_v2.png",
+    out_name="temporal_cos_goal_by_turn_v3.png",
 )
 
 print(f"\nAll done. Outputs -> {OUTPUT_DIR}")

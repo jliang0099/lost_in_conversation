@@ -38,7 +38,6 @@ class ConversationSimulatorSharded:
         user_temperature=0,
         dataset_fn=None,
         log_folder="logs",
-        hf_backend: Optional[str] = None,   # "local" | "api" | None (use env var)
         track_activation=False,
     ):
         self.task_name = sample["task"]
@@ -53,14 +52,13 @@ class ConversationSimulatorSharded:
         self.log_folder = log_folder
         self.system_message = self.task.generate_system_prompt(self.sample)
         self.answer_description = self.task.get_answer_description()
-        self.hf_backend = hf_backend
 
         self.run_with_custom_temperature = assistant_temperature != 1.0 or user_temperature != 1.0
         self.assistant_temperature = assistant_temperature
         self.user_temperature = user_temperature
 
-        # self.trace = [{"role": "system", "content": self.system_message, "timestamp": date_str()}]
-        self.trace = [{"role": "system", "content": "You are a helpful assistant.", "timestamp": date_str()}]
+        self.trace = [{"role": "system", "content": self.system_message, "timestamp": date_str()}]
+        # self.trace = [{"role": "system", "content": "You are a helpful assistant.", "timestamp": date_str()}]
         
         self.activation_tracker = ActivationTracker(layers=[12, 16, 20, 24, 28], task=self.task, sample=self.sample["task_id"], track_full_hidden_states=True) if track_activation else None
 
@@ -72,7 +70,9 @@ class ConversationSimulatorSharded:
         # REASONING_MODEL_KEYWORDS = ("o1", "o3", "deepseek-r1", "qwq", "deepseek-r")
         # is_reasoning_model = any(kw in self.assistant_model.lower() for kw in REASONING_MODEL_KEYWORDS)
         # max_assistant_tokens = 10000 if is_reasoning_model else 1000
-        max_assistant_tokens = 10000
+        
+        # TODO
+        max_assistant_tokens = 1000 # TEMP: set to 512 for testing; can increase to 1000+ for final runs depending on model capacity
 
         is_completed, is_correct, score = False, False, None
         shards = self.sample["shards"]
@@ -108,15 +108,12 @@ class ConversationSimulatorSharded:
             # 2. Assistant response  ← uses HF generate() instead of OpenAI
             assistant_response_obj = generate(
                 messages=extract_conversation(self.trace, to_str=False),
-                model=self.assistant_model,
+                model_name=self.assistant_model,
                 temperature=self.assistant_temperature,
-                return_metadata=True,
                 max_tokens=max_assistant_tokens,
-                backend=self.hf_backend,
-                
                 is_first_turn=is_first_turn,
-                is_last_turn=is_last_turn,
                 activation_tracker=self.activation_tracker,
+                return_metadata=True
             )
             
             assistant_response = assistant_response_obj["message"]

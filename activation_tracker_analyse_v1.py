@@ -84,6 +84,8 @@ with open(JSONL_PATH, "r") as f:
         rec = json.loads(line)
         conv_id = rec.get("conv_id")
         score = rec.get("score")
+        if score is None:
+            score = 0.0
         if conv_id is None or score is None:
             continue
         score_map[conv_id] = int(float(score))
