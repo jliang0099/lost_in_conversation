@@ -8,7 +8,7 @@ from activation_tracker import ActivationTracker
 import requests
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_MODEL = "Qwen/Qwen2.5-14B-Instruct"
 
 # ---------------------------------------------------------------------------
 # vLLM routing table
@@ -21,14 +21,14 @@ DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 #   GPU 3    →  hidden-state extraction (HF, loaded below)
 # ---------------------------------------------------------------------------
 _VLLM_REGISTRY: dict[str, tuple[str, int]] = {
-    "meta-llama/Llama-3.1-8B-Instruct":  ("127.0.0.1", 5001),
+    "Qwen/Qwen2.5-14B-Instruct":  ("127.0.0.1", 5001),
     "microsoft/phi-4":         ("127.0.0.1", 5002),
     # Add more models here as needed, e.g.:
     # "another/model": ("127.0.0.1", 5003),
 }
 
 # GPU reserved exclusively for hidden-state extraction
-_ACTIVATION_GPU = "cuda:2"
+# _ACTIVATION_GPU = "cuda:1"  # "cuda:3" --- IGNORE --- using both 1 and 2 to load the 20B model for extraction
 
 # Model to load on _ACTIVATION_GPU for hidden-state extraction.
 # Must be the same weights the activation_tracker expects (8B by default).
@@ -67,16 +67,32 @@ def _get_activation_model(model_name: str = _ACTIVATION_MODEL):
     Pinned to _ACTIVATION_GPU (cuda:3) — never touches the vLLM GPUs.
     """
     if model_name not in _activation_model_cache:
-        print(f"[HF-activation] Loading '{model_name}' onto {_ACTIVATION_GPU} ...")
+        # print(f"[HF-activation] Loading '{model_name}' onto {_ACTIVATION_GPU} ...")
         tokenizer = AutoTokenizer.from_pretrained(model_name)
+        
+        # 权重主体放GPU1，输入输出层放GPU0（中间激活跟着层走）
+        device_map = {
+            "model.embed_tokens": 0,      # 输入embedding在GPU0
+            "model.norm": 3,
+            "lm_head": 3,
+            # 前半层放GPU0（中间激活留在GPU0）
+            **{f"model.layers.{i}": 1 for i in range(0, 20)},
+            # 后半层放GPU1
+            **{f"model.layers.{i}": 1 for i in range(20, 48)},
+        }
+        
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch.float16,
-            device_map={"": _ACTIVATION_GPU},   # pin every layer to GPU 3
+            device_map=device_map,
         )
         model.eval()
+        
+        # 关键：长序列下关闭不需要的功能
+        model.config.use_cache = False  # prefill-only不需要KV cache
+        
         _activation_model_cache[model_name] = (model, tokenizer)
-        print(f"[HF-activation] '{model_name}' ready on {_ACTIVATION_GPU}.")
+        # print(f"[HF-activation] '{model_name}' ready on {_ACTIVATION_GPU}.")
     return _activation_model_cache[model_name]
 
 
@@ -187,8 +203,9 @@ class Model:
         model, tokenizer = _get_activation_model(model_name)
 
         prompt = _apply_chat_template(messages, tokenizer)
+        # print("prompt for activation extraction:", prompt)
         inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-
+        
         t0 = time.time()
         with torch.no_grad():
             prefill_out = model(

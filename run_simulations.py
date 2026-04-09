@@ -37,16 +37,16 @@ if __name__ == '__main__':
     multiprocessing.freeze_support()
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--dataset_file", type=str, default="data/(v2)sharded_gsm8k.json", help="Dataset file to use")
+    parser.add_argument("--dataset_file", type=str, default="data/sharded_instructions_600.json", help="Dataset file to use")
 
     parser.add_argument("--N_full_runs", type=int, default=1, help="Number of full runs per model")
     parser.add_argument("--N_concat_runs", type=int, default=1, help="Number of concat runs per model")
     parser.add_argument("--N_sharded_runs", type=int, default=1, help="Number of sharded runs per model")
-    parser.add_argument("--models", nargs="+", default=["meta-llama/Llama-3.1-8B-Instruct"], # `, "gpt-4o"`
+    parser.add_argument("--models", nargs="+", default=["Qwen/Qwen2.5-14B-Instruct"], # `, "gpt-4o"`
                         help="List of models to run experiments with")
-    parser.add_argument("--tasks", nargs="+", default=["math"], help="Tasks to run experiments with") # "code", "database", "actions", "math", "data2text", "summary", "translation"
-    parser.add_argument("--system_model", type=str, default="meta-llama/Llama-3.1-8B-Instruct", help="System model to use")
-    parser.add_argument("--user_model", type=str, default="meta-llama/Llama-3.1-8B-Instruct", help="User model to use")
+    parser.add_argument("--tasks", nargs="+", default=["code"], help="Tasks to run experiments with") # "code", "database", "actions", "math", "data2text", "summary", "translation"
+    parser.add_argument("--system_model", type=str, default="Qwen/Qwen2.5-14B-Instruct", help="System model to use")
+    parser.add_argument("--user_model", type=str, default="Qwen/Qwen2.5-14B-Instruct", help="User model to use")
     parser.add_argument("--N_workers", type=int, default=1, help="Number of workers to run experiments with")
     parser.add_argument("--log_folder", type=str, default="logs", help="Log folder to use")
     parser.add_argument("--verbose", action="store_true", help="Print verbose output")
@@ -67,7 +67,7 @@ if __name__ == '__main__':
 
     samples = [d for d in samples if d["task"] in args.tasks]
     
-    samples = [sample for sample in samples if len(sample["shards"]) >= 6]
+    # samples = [sample for sample in samples if len(sample["shards"]) >= 6]
 
     print(f"Loaded {len(samples)} samples")
     random.shuffle(samples)

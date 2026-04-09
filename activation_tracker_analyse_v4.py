@@ -49,7 +49,8 @@ MAX_TURN = 8    # only keep turn_3 … turn_8
 MIN_N   = 3     # minimum samples per class to plot a point
 N_BOOT  = 2000  # bootstrap resamples for CI
 CI      = 90    # confidence interval %
-SEED    = 42
+SEED    = 44
+EXACT_TOTAL_TURN_ONLY = False  # True: analyze turn_t with only convs whose total turns == t
 
 # ── 工具函数 ──────────────────────────────────────────────────────────────────
 
@@ -187,10 +188,13 @@ for pt_dir in PT_SOURCES:
                 hs_by_label[tlabel][i].numpy() for i in range(len(LAYERS))
             ]
 
+        max_turn_in_conv = max(turn_index(tlabel) for tlabel in turn_labels)
+
         conv_records[conv_id] = {
             "score"  : score_map[conv_id],
             "goal_hs": goal_hs,
             "turns"  : turns_data,
+            "max_turn": max_turn_in_conv,
         }
 
 print(f"\n  Loaded conv records : {len(conv_records)}")
@@ -224,6 +228,9 @@ for t in range(3, MAX_TURN + 1):
         turns = rec["turns"]
         # Conv must have all three turns needed to compute metrics
         if turn_now not in turns or turn_prev1 not in turns or turn_prev2 not in turns:
+            continue
+        # Optional strict mode: for turn_t, keep only convs with total turns == t
+        if EXACT_TOTAL_TURN_ONLY and rec["max_turn"] != t:
             continue
         if rec["score"] == 1:
             correct_ids.append(conv_id)

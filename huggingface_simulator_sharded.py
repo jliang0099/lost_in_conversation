@@ -60,7 +60,7 @@ class ConversationSimulatorSharded:
         self.trace = [{"role": "system", "content": self.system_message, "timestamp": date_str()}]
         # self.trace = [{"role": "system", "content": "You are a helpful assistant.", "timestamp": date_str()}]
         
-        self.activation_tracker = ActivationTracker(layers=[12, 16, 20, 24, 28], task=self.task, sample=self.sample["task_id"], track_full_hidden_states=True) if track_activation else None
+        self.activation_tracker = ActivationTracker(layers=[10, 20, 30, 40, 46], task=self.task, sample=self.sample["task_id"], track_full_hidden_states=True) if track_activation else None
 
     def get_num_turns(self, participant="assistant"):
         return sum(1 for msg in self.trace if msg["role"] == participant)
@@ -72,7 +72,7 @@ class ConversationSimulatorSharded:
         # max_assistant_tokens = 10000 if is_reasoning_model else 1000
         
         # TODO
-        max_assistant_tokens = 1000 # TEMP: set to 512 for testing; can increase to 1000+ for final runs depending on model capacity
+        max_assistant_tokens = 512 # TEMP: set to 512 for testing; can increase to 1000+ for final runs depending on model capacity
 
         is_completed, is_correct, score = False, False, None
         shards = self.sample["shards"]
