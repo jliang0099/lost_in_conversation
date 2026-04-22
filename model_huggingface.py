@@ -73,12 +73,12 @@ def _get_activation_model(model_name: str = _ACTIVATION_MODEL):
         # 权重主体放GPU1，输入输出层放GPU0（中间激活跟着层走）
         device_map = {
             "model.embed_tokens": 0,      # 输入embedding在GPU0
-            "model.norm": 3,
-            "lm_head": 3,
+            "model.norm": 0,
+            "lm_head": 0,
             # 前半层放GPU0（中间激活留在GPU0）
-            **{f"model.layers.{i}": 1 for i in range(0, 20)},
+            **{f"model.layers.{i}": 0 for i in range(0, 10)},
             # 后半层放GPU1
-            **{f"model.layers.{i}": 1 for i in range(20, 48)},
+            **{f"model.layers.{i}": 1 for i in range(10, 48)},
         }
         
         model = AutoModelForCausalLM.from_pretrained(

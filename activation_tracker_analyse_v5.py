@@ -24,15 +24,15 @@ from sklearn.metrics import roc_auc_score
 PT_DIR = Path(
     "logs/hidden_states/code/sharded-at0-ut0_code_Qwen_Qwen2.5-14B-Instruct"
 )
-PT_DIR_ADD = Path(
-    "logs/hidden_states/code/(add_v2)sharded-at0-ut0_code_Qwen_Qwen2.5-14B-Instruct"
-)
+# PT_DIR_ADD = Path(
+#     "logs/hidden_states/math/(add_v2)sharded-at0-ut0_math_meta-llama_Llama-3.1-8B-Instruct"
+# )
 JSONL_PATH = Path(
     "logs/code/sharded-at0-ut0/sharded-at0-ut0_code_Qwen_Qwen2.5-14B-Instruct.jsonl"
 )
-JSONL_PATH_ADD = Path(
-    "logs/code/sharded-at0-ut0/(add_v2)sharded-at0-ut0_code_Qwen_Qwen2.5-14B-Instruct.jsonl"
-)
+# JSONL_PATH_ADD = Path(
+#     "logs/math/sharded-at0-ut0/(add_v2)sharded-at0-ut0_math_meta-llama_Llama-3.1-8B-Instruct.jsonl"
+# )
 
 PT_SOURCES    = [PT_DIR]
 JSONL_SOURCES = [JSONL_PATH]
@@ -45,8 +45,8 @@ MAX_TOTAL_TURN = 8
 MIN_N          = 3
 N_BOOT         = 2000
 CI             = 90
-SEED           = 47
-BALANCE_CLASSES = False  # 是否在每个 total_turns 组内平衡正确/错误样本数量
+SEED           = 49
+BALANCE_CLASSES = False # 是否在每个 total_turns 组内平衡正确/错误样本数量
 
 COLOR_CORRECT   = "#2563EB"
 COLOR_INCORRECT = "#DC2626"
@@ -278,7 +278,7 @@ for total_t in range(MIN_TOTAL_TURN, MAX_TOTAL_TURN + 1):
 
 # ── Step 4: CSV ───────────────────────────────────────────────────────────────
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-summary_csv = OUTPUT_DIR / "temporal_cosine_summary_v5.csv"
+summary_csv = OUTPUT_DIR / "temporal_cosine_summary_v6.csv"
 rows = []
 
 for total_t, layer_dict in group_data.items():
@@ -342,7 +342,7 @@ print("=" * 60)
 
 
 def plot_group(total_t: int, layer_dict: dict, metric_key: str,
-               title_prefix: str, out_name: str):
+               title_prefix: str, out_name: str, ylim=(-1.0, 1.0)):
     """
     One figure: 1 row × len(LAYERS) subplots.
     x-axis = turn index (turn_3 … turn_{total_t}).
@@ -390,7 +390,7 @@ def plot_group(total_t: int, layer_dict: dict, metric_key: str,
 
         if not x_vals:
             ax.set_title(f"Layer {layer}\n(no data)", fontsize=11)
-            ax.set_ylim(-1.0, 1.0)
+            ax.set_ylim(ylim)
             continue
 
         x = np.array(x_vals)
@@ -416,7 +416,7 @@ def plot_group(total_t: int, layer_dict: dict, metric_key: str,
         ax.set_title(f"Layer {layer}", fontsize=12, fontweight="bold")
         ax.set_xlabel("turn index")
         ax.set_xticks(x_vals)
-        ax.set_ylim(-1.0, 1.0)
+        ax.set_ylim(ylim)
         ax.grid(alpha=0.25)
         if li == 0:
             ax.set_ylabel("cosine similarity")
@@ -442,6 +442,7 @@ for total_t, layer_dict in sorted(group_data.items()):
         metric_key   = "cos_step",
         title_prefix = "Temporal Curvature: cos(Δhidden_n, Δhidden_{n-1})",
         out_name     = f"cos_step_total{total_t}.png",
+        ylim         = (-1.0, 0.0),
     )
     plot_group(
         total_t      = total_t,
@@ -449,6 +450,7 @@ for total_t, layer_dict in sorted(group_data.items()):
         metric_key   = "cos_goal",
         title_prefix = "Goal Progress: cos(Δhidden_n, goal − hidden_{n-1})",
         out_name     = f"cos_goal_total{total_t}.png",
+        ylim         = (-1.0, 0.0),
     )
 
 
@@ -524,7 +526,7 @@ for t in range(3, MAX_TOTAL_TURN + 1):
                 cell["label"].append(cls_score)
 
 
-def plot_overview(metric_key: str, title: str, out_name: str):
+def plot_overview(metric_key: str, title: str, out_name: str, ylim=(-1.0, 1.0)):
     fig, axes = plt.subplots(
         1, len(LAYERS),
         figsize=(5 * len(LAYERS), 4.8),
@@ -567,7 +569,7 @@ def plot_overview(metric_key: str, title: str, out_name: str):
 
         if not x_vals:
             ax.set_title(f"Layer {layer}\n(no data)", fontsize=11)
-            ax.set_ylim(-1.0, 0.0)
+            ax.set_ylim(ylim)
             continue
 
         x = np.array(x_vals)
@@ -592,7 +594,7 @@ def plot_overview(metric_key: str, title: str, out_name: str):
         ax.set_title(f"Layer {layer}", fontsize=12, fontweight="bold")
         ax.set_xlabel("turn index")
         ax.set_xticks(x_vals)
-        ax.set_ylim(-1.0, 0.0)
+        ax.set_ylim(ylim)
         ax.grid(alpha=0.25)
         if li == 0:
             ax.set_ylabel("cosine similarity")
@@ -619,11 +621,13 @@ plot_overview(
     metric_key = "cos_step",
     title      = "Temporal Curvature: cos(Δhidden_n, Δhidden_{n-1})  [all turns overview]",
     out_name   = "cos_step_overview_all.png",
+    ylim       = (-1.0, 0.0),
 )
 plot_overview(
     metric_key = "cos_goal",
     title      = "Goal Progress: cos(Δhidden_n, goal − hidden_{n-1})  [all turns overview]",
     out_name   = "cos_goal_overview_all.png",
+    ylim       = (-1.0, 0.0),
 )
 
 print(f"\nAll done. Outputs → {OUTPUT_DIR}")
