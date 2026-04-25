@@ -42,11 +42,11 @@ if __name__ == '__main__':
     parser.add_argument("--N_full_runs", type=int, default=1, help="Number of full runs per model")
     parser.add_argument("--N_concat_runs", type=int, default=1, help="Number of concat runs per model")
     parser.add_argument("--N_sharded_runs", type=int, default=1, help="Number of sharded runs per model")
-    parser.add_argument("--models", nargs="+", default=["Qwen/Qwen2.5-14B-Instruct"], # `, "gpt-4o"`
+    parser.add_argument("--models", nargs="+", default=["meta-llama/Llama-3.1-8B-Instruct"], # `, "gpt-4o"`
                         help="List of models to run experiments with")
-    parser.add_argument("--tasks", nargs="+", default=["code"], help="Tasks to run experiments with") # "code", "database", "actions", "math", "data2text", "summary", "translation"
-    parser.add_argument("--system_model", type=str, default="Qwen/Qwen2.5-14B-Instruct", help="System model to use")
-    parser.add_argument("--user_model", type=str, default="Qwen/Qwen2.5-14B-Instruct", help="User model to use")
+    parser.add_argument("--tasks", nargs="+", default=["math"], help="Tasks to run experiments with") # "code", "database", "actions", "math", "data2text", "summary", "translation"
+    parser.add_argument("--system_model", type=str, default="meta-llama/Llama-3.1-8B-Instruct", help="System model to use")
+    parser.add_argument("--user_model", type=str, default="meta-llama/Llama-3.1-8B-Instruct", help="User model to use")
     parser.add_argument("--N_workers", type=int, default=1, help="Number of workers to run experiments with")
     parser.add_argument("--log_folder", type=str, default="logs", help="Log folder to use")
     parser.add_argument("--verbose", action="store_true", help="Print verbose output")
