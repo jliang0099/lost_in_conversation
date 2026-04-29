@@ -1,5 +1,6 @@
 import json
 import random
+from typing import Optional
 
 from activation_tracker import ActivationTracker
 from utils import print_colored, extract_conversation, date_str
@@ -8,6 +9,7 @@ from system_agent import SystemAgent
 from user_agent import UserAgent
 from tasks import get_task
 from model_huggingface import generate
+from steering import SteeringController
 
 # ──────────────────────────────────────────────
 # HuggingFace generate() — drop-in replacement for model_openai.generate()
@@ -39,6 +41,7 @@ class ConversationSimulatorSharded:
         dataset_fn=None,
         log_folder="logs",
         track_activation=False,
+        steering_controller=None,
     ):
         self.task_name = sample["task"]
         self.task = get_task(self.task_name)
@@ -60,7 +63,10 @@ class ConversationSimulatorSharded:
         self.trace = [{"role": "system", "content": self.system_message, "timestamp": date_str()}]
         # self.trace = [{"role": "system", "content": "You are a helpful assistant.", "timestamp": date_str()}]
         
-        self.activation_tracker = ActivationTracker(layers=[12, 16, 20, 24, 28], task=self.task, sample=self.sample["task_id"], track_full_hidden_states=True) if track_activation else None
+        self.activation_tracker = ActivationTracker(layers=[12, 16, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], task=self.task, sample=self.sample["task_id"], track_full_hidden_states=True) if track_activation else None
+
+        self.steering_controller: Optional[SteeringController] = steering_controller
+        self._steer_goal_coords: Optional[dict] = None  # dict[layer→float], set on turn 1
 
     def get_num_turns(self, participant="assistant"):
         return sum(1 for msg in self.trace if msg["role"] == participant)
@@ -113,11 +119,29 @@ class ConversationSimulatorSharded:
                 max_tokens=max_assistant_tokens,
                 is_first_turn=is_first_turn,
                 activation_tracker=self.activation_tracker,
-                return_metadata=True
+                return_metadata=True,
+                steering_controller=self.steering_controller,
+                steer_goal_coords=self._steer_goal_coords,
             )
-            
+
+            # Propagate per-layer goal coords across turns (set on turn 1, reused after)
+            if self.steering_controller is not None:
+                self._steer_goal_coords = assistant_response_obj.get(
+                    "steer_goal_coords", self._steer_goal_coords
+                )
+
             assistant_response = assistant_response_obj["message"]
-            self.trace.append({"role": "assistant", "content": assistant_response, "timestamp": date_str(), "cost_usd": assistant_response_obj["total_usd"]})
+            assistant_trace_entry = {
+                "role":      "assistant",
+                "content":   assistant_response,
+                "timestamp": date_str(),
+                "cost_usd":  assistant_response_obj["total_usd"],
+            }
+            if self.steering_controller is not None:
+                assistant_trace_entry["steer_alphas"]         = assistant_response_obj.get("steer_alphas")
+                assistant_trace_entry["steer_goal_coords"]    = assistant_response_obj.get("steer_goal_coords")
+                assistant_trace_entry["steer_current_coords"] = assistant_response_obj.get("steer_current_coords")
+            self.trace.append(assistant_trace_entry)
             if verbose:
                 print_colored(f"[assistant] {assistant_response}", "red")
 

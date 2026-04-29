@@ -8,22 +8,28 @@ from huggingface_simulator_sharded import ConversationSimulatorSharded
 from concurrent.futures import ThreadPoolExecutor
 from utils_log import get_run_counts
 from collections import Counter
+from steering import SteeringController
 
 def run_simulation(todo):
     dataset_fn = todo["dataset_fn"]
     try:
         assistant_temp = todo.get("assistant_temperature", 0)
         user_temp = todo.get("user_temperature", 0)
-        # print(f"assistant_temp: {assistant_temp}; user_temp: {user_temp}")
-        # if todo["conv_type"].startswith("full"):
-        #     conversation_simulator = ConversationSimulatorFull(todo["sample"], assistant_model=todo["assistant_model"], system_model=todo["system_model"], temperature=assistant_temp, dataset_fn=dataset_fn, log_folder=args.log_folder)
-        # elif todo["conv_type"].startswith("concat"):
-        #     conversation_simulator = ConversationSimulatorFull(todo["sample"], assistant_model=todo["assistant_model"], system_model=todo["system_model"], run_concat=True, temperature=assistant_temp, dataset_fn=dataset_fn, log_folder=args.log_folder)
-        # elif todo["conv_type"].startswith("sharded"):
-        #     conversation_simulator = ConversationSimulatorSharded(todo["sample"], assistant_model=todo["assistant_model"], system_model=todo["system_model"], user_model=todo["user_model"], assistant_temperature=assistant_temp, user_temperature=user_temp, dataset_fn=dataset_fn, log_folder=args.log_folder)
-        
+        steering_controller = todo.get("steering_controller")
+
         if todo["conv_type"].startswith("sharded"):
-            conversation_simulator = ConversationSimulatorSharded(todo["sample"], assistant_model=todo["assistant_model"], system_model=todo["system_model"], user_model=todo["user_model"], assistant_temperature=assistant_temp, user_temperature=user_temp, dataset_fn=dataset_fn, log_folder=args.log_folder, track_activation=True)
+            conversation_simulator = ConversationSimulatorSharded(
+                todo["sample"],
+                assistant_model=todo["assistant_model"],
+                system_model=todo["system_model"],
+                user_model=todo["user_model"],
+                assistant_temperature=assistant_temp,
+                user_temperature=user_temp,
+                dataset_fn=dataset_fn,
+                log_folder=args.log_folder,
+                track_activation=True,
+                steering_controller=steering_controller,
+            )
 
         conversation_simulator.run(verbose=args.verbose)
 
@@ -54,7 +60,20 @@ if __name__ == '__main__':
     parser.add_argument("--assistant_temperature", type=float, default=0, help="Temperature to use for assistant models")
     parser.add_argument("--user_temperature", type=float, default=0, help="Temperature to use for user models")
 
+    parser.add_argument("--steering_artifacts_dir", type=str, default=None,
+                        help="Directory containing layer_L.pt steering artifacts. "
+                             "If omitted, no steering is applied.")
+    parser.add_argument("--steer_alpha", type=float, default=0.5,
+                        help="Base proportional steering strength (used when --steering_artifacts_dir is set).")
+
     args = parser.parse_args()
+
+    # Build SteeringController once; shared (read-only) across all worker threads.
+    if args.steering_artifacts_dir is not None:
+        steering_controller = SteeringController(args.steering_artifacts_dir, base_alpha=args.steer_alpha)
+        print(f"[steering] artifacts_dir={args.steering_artifacts_dir}  base_alpha={args.steer_alpha}")
+    else:
+        steering_controller = None
 
     # windows fix dataset_file to be unix format
     dataset_fn = args.dataset_file
@@ -93,11 +112,11 @@ if __name__ == '__main__':
             # all_todos += [{"sample": sample, "assistant_model": assistant_model, "conv_type": concat_ct, "system_model": args.system_model, "dataset_fn": dataset_fn}] * (args.N_concat_runs - concat_run_counts[sample["task_id"]])
             all_todos += [{"sample": sample, "assistant_model": assistant_model, "conv_type": sharded_ct, "system_model": args.system_model, "user_model": args.user_model, "dataset_fn": dataset_fn}] * (args.N_sharded_runs - sharded_run_counts[sample["task_id"]])
 
-    if args.assistant_temperature != 1.0 or args.user_temperature != 1.0:
-        # update todos with temperature
-        for todo in all_todos:
+    for todo in all_todos:
+        if args.assistant_temperature != 1.0 or args.user_temperature != 1.0:
             todo["assistant_temperature"] = args.assistant_temperature
             todo["user_temperature"] = args.user_temperature
+        todo["steering_controller"] = steering_controller  # None = no steering
 
     random.shuffle(all_todos)
 

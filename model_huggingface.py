@@ -5,10 +5,11 @@ import time
 from typing import Optional
 import torch
 from activation_tracker import ActivationTracker
+from steering import SteeringController
 import requests
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-DEFAULT_MODEL = "Qwen/Qwen2.5-14B-Instruct"
+DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 
 # ---------------------------------------------------------------------------
 # vLLM routing table
@@ -21,7 +22,7 @@ DEFAULT_MODEL = "Qwen/Qwen2.5-14B-Instruct"
 #   GPU 3    →  hidden-state extraction (HF, loaded below)
 # ---------------------------------------------------------------------------
 _VLLM_REGISTRY: dict[str, tuple[str, int]] = {
-    "Qwen/Qwen2.5-14B-Instruct":  ("127.0.0.1", 5001),
+    "meta-llama/Llama-3.1-8B-Instruct":  ("127.0.0.1", 5001),
     "microsoft/phi-4":         ("127.0.0.1", 5002),
     # Add more models here as needed, e.g.:
     # "another/model": ("127.0.0.1", 5003),
@@ -76,9 +77,9 @@ def _get_activation_model(model_name: str = _ACTIVATION_MODEL):
             "model.norm": 0,
             "lm_head": 0,
             # 前半层放GPU0（中间激活留在GPU0）
-            **{f"model.layers.{i}": 0 for i in range(0, 10)},
+            **{f"model.layers.{i}": 0 for i in range(0, 15)},
             # 后半层放GPU1
-            **{f"model.layers.{i}": 1 for i in range(10, 48)},
+            **{f"model.layers.{i}": 1 for i in range(15, 32)},
         }
         
         model = AutoModelForCausalLM.from_pretrained(
@@ -238,6 +239,131 @@ class Model:
         return client.inference(messages)
 
     # ------------------------------------------------------------------
+    # HF steered generation (activation tracking + hook injection in one pass)
+    # ------------------------------------------------------------------
+    def _steered_hf_generate(
+        self,
+        messages: list[dict],
+        model_name: str,
+        temperature: float,
+        max_tokens: int,
+        is_first_turn: bool,
+        activation_tracker: Optional[ActivationTracker],
+        steering_controller: SteeringController,
+        steer_goal_coords: Optional[dict],
+    ) -> dict:
+        """
+        Single-pass HF generation with per-layer activation steering.
+
+        Each layer in steering_controller.steer_layers independently:
+          - measures its own goal-imprint gap
+          - computes its own proportional alpha
+          - applies its own steering vector during generation
+
+        Steps:
+          1. Prefill-only forward pass to extract hidden states.
+          2. Update activation_tracker (set_goal on turn 1, record after).
+          3. Per layer: extract coord, compute alpha, register hook.
+          4. model.generate() with all hooks active.
+          5. Return response dict with per-layer steering metadata.
+        """
+        model, tokenizer = _get_activation_model(model_name)
+
+        # Tokenise and move input to the first device in the device_map
+        prompt = _apply_chat_template(messages, tokenizer)
+        inputs = tokenizer(prompt, return_tensors="pt")
+        device = model.model.embed_tokens.weight.device
+        input_ids = inputs["input_ids"].to(device)
+        attention_mask = inputs.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
+
+        # 1. Prefill for hidden-state extraction (no KV cache needed here)
+        with torch.no_grad():
+            prefill_out = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                use_cache=False,
+            )
+        hs = list(prefill_out.hidden_states)
+
+        # 2. Update activation tracker
+        if activation_tracker is not None:
+            if is_first_turn:
+                activation_tracker.set_goal(hs)
+            else:
+                activation_tracker.record_activation(hs)
+
+        # 3. Per-layer: extract coords, compute alpha, register hook
+        current_coords: dict[int, float] = steering_controller.extract_coords(hs)
+        alphas_used:    dict[int, float] = {}
+        new_goal_coords: dict[int, float] = {}
+        hook_handles = []
+
+        for layer_idx in steering_controller.steer_layers:
+            current = current_coords[layer_idx]
+            if is_first_turn:
+                # Turn 1: record goal position, no steering
+                new_goal_coords[layer_idx] = current
+                alphas_used[layer_idx] = 0.0
+            elif steer_goal_coords is not None:
+                new_goal_coords[layer_idx] = steer_goal_coords[layer_idx]
+                alpha = steering_controller.compute_steer_alpha(
+                    steer_goal_coords[layer_idx], current
+                )
+                alphas_used[layer_idx] = alpha
+                hook_fn = steering_controller.make_hook(alpha, layer_idx)
+                if hook_fn is not None:
+                    hook_handles.append(
+                        model.model.layers[layer_idx].register_forward_hook(hook_fn)
+                    )
+            else:
+                new_goal_coords[layer_idx] = current
+                alphas_used[layer_idx] = 0.0
+
+        # 4. Autoregressive generation with KV cache
+        gen_kwargs: dict = dict(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_tokens,
+            pad_token_id=(
+                tokenizer.pad_token_id
+                if tokenizer.pad_token_id is not None
+                else tokenizer.eos_token_id
+            ),
+        )
+        if temperature > 0:
+            gen_kwargs["do_sample"] = True
+            gen_kwargs["temperature"] = temperature
+        else:
+            gen_kwargs["do_sample"] = False
+
+        model.config.use_cache = True
+        try:
+            with torch.no_grad():
+                output_ids = model.generate(**gen_kwargs)
+        finally:
+            model.config.use_cache = False
+            for h in hook_handles:
+                h.remove()
+
+        # 5. Decode new tokens only
+        n_input = input_ids.shape[1]
+        message = tokenizer.decode(
+            output_ids[0, n_input:], skip_special_tokens=True
+        )
+
+        return {
+            "message":              message,
+            "finish_reason":        "stop",
+            "total_usd":            0.0,
+            "steer_goal_coords":    new_goal_coords,    # dict[layer → float]
+            "steer_current_coords": current_coords,     # dict[layer → float]
+            "steer_alphas":         alphas_used,        # dict[layer → float]
+        }
+
+    # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
     def generate(
@@ -251,27 +377,42 @@ class Model:
         is_first_turn: Optional[bool] = None,
         activation_tracker=None,
         return_metadata: bool = False,
-    ) -> str:
+        steering_controller: Optional[SteeringController] = None,
+        steer_goal_coords: Optional[dict] = None,
+    ) -> dict:
         messages = format_messages(list(messages), variables)
         max_tokens = max_tokens or 1000
 
         last_exc: Optional[Exception] = None
-        # print(f"\n[generate] model={model_name} | messages={messages}")
         t0 = time.time()
 
         for attempt in range(max_retries):
             try:
-                if activation_tracker is not None:
-                    self.record_activations(
-                        messages,
-                        _ACTIVATION_MODEL,   # always extract with the 8B on GPU 3
-                        is_first_turn,
-                        activation_tracker,
+                # print(steering_controller)
+                if steering_controller is not None:
+                    # HF path: activation tracking + steering in one prefill pass
+                    response = self._steered_hf_generate(
+                        messages=messages,
+                        model_name=_ACTIVATION_MODEL,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        is_first_turn=bool(is_first_turn),
+                        activation_tracker=activation_tracker,
+                        steering_controller=steering_controller,
+                        steer_goal_coords=steer_goal_coords,
                     )
-                    # print(f"[generate] activation_tracker updated in {time.time() - t0:.2f}s")
-
-                response = self.generate_vllm(messages, model_name, temperature, max_tokens)
-                # print(f"[generate] vLLM completed in {time.time() - t0:.2f}s")
+                else:
+                    # Original path: optional activation extraction, then vLLM
+                    if activation_tracker is not None:
+                        self.record_activations(
+                            messages,
+                            _ACTIVATION_MODEL,
+                            is_first_turn,
+                            activation_tracker,
+                        )
+                    response = self.generate_vllm(
+                        messages, model_name, temperature, max_tokens
+                    )
                 return response
 
             except Exception as exc:
