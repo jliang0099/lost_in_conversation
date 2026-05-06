@@ -25,7 +25,7 @@ class UserAgent:
 
             return initial_query, shard_id, 0.0
 
-        else: # Turn 2 ... n
+        else: # Turn 2 ... n            
             shard_revealed_ids = [msg["content"]["shard_id"] for msg in conversation if msg["role"] == "log" and msg["content"]["type"] == "shard_revealed"]
 
             shards = sample["shards"][1:] # filter out the first shard, which is the initial query

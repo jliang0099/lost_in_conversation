@@ -4,18 +4,19 @@ import multiprocessing
 import json
 import tqdm
 from huggingface_simulator_sharded import ConversationSimulatorSharded
+from simulator_snowball import ConversationSimulatorSnowball
 # from simulator_full import ConversationSimulatorFull
 from concurrent.futures import ThreadPoolExecutor
 from utils_log import get_run_counts
 from collections import Counter
-from steering import SteeringController
+from steering.steering import SteeringController
 
 def run_simulation(todo):
     dataset_fn = todo["dataset_fn"]
     try:
         assistant_temp = todo.get("assistant_temperature", 0)
         user_temp = todo.get("user_temperature", 0)
-        steering_controller = todo.get("steering_controller")
+        # steering_controller = todo.get("steering_controller")
 
         if todo["conv_type"].startswith("sharded"):
             conversation_simulator = ConversationSimulatorSharded(
@@ -28,7 +29,24 @@ def run_simulation(todo):
                 dataset_fn=dataset_fn,
                 log_folder=args.log_folder,
                 track_activation=True,
-                steering_controller=steering_controller,
+                
+                # inertia_check=todo.get("inertia_check", False),
+                # inertia_curvature_threshold=todo.get("inertia_curvature_threshold", -0.2),
+                # inertia_var_slope_threshold=todo.get("inertia_var_slope_threshold", 0.0),
+                
+                # steering_controller=steering_controller,
+            )
+        elif todo["conv_type"].startswith("snowball"):
+            conversation_simulator = ConversationSimulatorSnowball(
+                todo["sample"],
+                assistant_model=todo["assistant_model"],
+                system_model=todo["system_model"],
+                user_model=todo["user_model"],
+                assistant_temperature=assistant_temp,
+                user_temperature=user_temp,
+                dataset_fn=dataset_fn,
+                log_folder=args.log_folder,
+                track_activation=True,
             )
 
         conversation_simulator.run(verbose=args.verbose)
@@ -43,7 +61,7 @@ if __name__ == '__main__':
     multiprocessing.freeze_support()
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--dataset_file", type=str, default="data/sharded_instructions_600.json", help="Dataset file to use")
+    parser.add_argument("--dataset_file", type=str, default="data/(v2)sharded_gsm8k.json", help="Dataset file to use")
 
     parser.add_argument("--N_full_runs", type=int, default=1, help="Number of full runs per model")
     parser.add_argument("--N_concat_runs", type=int, default=1, help="Number of concat runs per model")
@@ -60,20 +78,27 @@ if __name__ == '__main__':
     parser.add_argument("--assistant_temperature", type=float, default=0, help="Temperature to use for assistant models")
     parser.add_argument("--user_temperature", type=float, default=0, help="Temperature to use for user models")
 
-    parser.add_argument("--steering_artifacts_dir", type=str, default=None,
-                        help="Directory containing layer_L.pt steering artifacts. "
-                             "If omitted, no steering is applied.")
-    parser.add_argument("--steer_alpha", type=float, default=0.5,
-                        help="Base proportional steering strength (used when --steering_artifacts_dir is set).")
+    # parser.add_argument("--inertia_check", action="store_true",
+    #                     help="Enable inertia-based prompt intervention (curvature + variance checks)")
+    # parser.add_argument("--inertia_curvature_threshold", type=float, default=-0.2,
+    #                     help="Temporal curvature κ below this triggers intervention (default: -0.2)")
+    # parser.add_argument("--inertia_var_slope_threshold", type=float, default=0.0,
+    #                     help="Variance slope below this triggers intervention (default: 0.0)")
+
+    # parser.add_argument("--steering_artifacts_dir", type=str, default=None,
+    #                     help="Directory containing layer_L.pt steering artifacts. "
+    #                          "If omitted, no steering is applied.")
+    # parser.add_argument("--steer_alpha", type=float, default=0.5,
+    #                     help="Base proportional steering strength (used when --steering_artifacts_dir is set).")
 
     args = parser.parse_args()
 
     # Build SteeringController once; shared (read-only) across all worker threads.
-    if args.steering_artifacts_dir is not None:
-        steering_controller = SteeringController(args.steering_artifacts_dir, base_alpha=args.steer_alpha)
-        print(f"[steering] artifacts_dir={args.steering_artifacts_dir}  base_alpha={args.steer_alpha}")
-    else:
-        steering_controller = None
+    # if args.steering_artifacts_dir is not None:
+    #     steering_controller = SteeringController(args.steering_artifacts_dir, base_alpha=args.steer_alpha)
+    #     print(f"[steering] artifacts_dir={args.steering_artifacts_dir}  base_alpha={args.steer_alpha}")
+    # else:
+    #     steering_controller = None
 
     # windows fix dataset_file to be unix format
     dataset_fn = args.dataset_file
@@ -94,29 +119,38 @@ if __name__ == '__main__':
 
     sharded_extra = f"-at{args.assistant_temperature}-ut{args.user_temperature}" if args.assistant_temperature != 1.0 or args.user_temperature != 1.0 else ""
     st_extra = f"-t{args.assistant_temperature}" if args.assistant_temperature != 1.0 else ""
-    sharded_ct, full_ct, concat_ct = f"sharded{sharded_extra}", f"full{st_extra}", f"concat{st_extra}"
+    sharded_ct, full_ct, concat_ct, snowball_ct = f"sharded{sharded_extra}", f"full{st_extra}", f"concat{st_extra}", f"snowball{sharded_extra}"
 
     all_tasks = list(set([sample["task"] for sample in samples]))
     for assistant_model in args.models:
-        sharded_run_counts, full_run_counts, concat_run_counts = Counter(), Counter(), Counter()
+        sharded_run_counts, full_run_counts, concat_run_counts, snowball_run_counts = Counter(), Counter(), Counter(), Counter()
         for task in all_tasks:
             sharded_run_counts.update(get_run_counts(sharded_ct, task, assistant_model, dataset_fn, log_folder=args.log_folder))
             full_run_counts.update(get_run_counts(full_ct, task, assistant_model, dataset_fn, log_folder=args.log_folder))
             concat_run_counts.update(get_run_counts(concat_ct, task, assistant_model, dataset_fn, log_folder=args.log_folder))
+            snowball_run_counts.update(get_run_counts(snowball_ct, task, assistant_model, dataset_fn, log_folder=args.log_folder))
         print(f"Sharded run counts: {sharded_run_counts}")
         print(f"Full run counts: {full_run_counts}")
         print(f"Concat run counts: {concat_run_counts}")
+        print(f"Snowball run counts: {snowball_run_counts}")
 
         for sample in samples:
             # all_todos += [{"sample": sample, "assistant_model": assistant_model, "conv_type": full_ct, "system_model": args.system_model, "dataset_fn": dataset_fn}] * (args.N_full_runs - full_run_counts[sample["task_id"]])
             # all_todos += [{"sample": sample, "assistant_model": assistant_model, "conv_type": concat_ct, "system_model": args.system_model, "dataset_fn": dataset_fn}] * (args.N_concat_runs - concat_run_counts[sample["task_id"]])
-            all_todos += [{"sample": sample, "assistant_model": assistant_model, "conv_type": sharded_ct, "system_model": args.system_model, "user_model": args.user_model, "dataset_fn": dataset_fn}] * (args.N_sharded_runs - sharded_run_counts[sample["task_id"]])
+            all_todos += [{"sample": sample, "assistant_model": assistant_model, "conv_type": snowball_ct, "system_model": args.system_model, "user_model": args.user_model, "dataset_fn": dataset_fn}] * (args.N_sharded_runs - sharded_run_counts[sample["task_id"]])
+            # all_todos += [{"sample": sample, "assistant_model": assistant_model, "conv_type": sharded_ct, "system_model": args.system_model, "user_model": args.user_model, "dataset_fn": dataset_fn}] * (args.N_sharded_runs - sharded_run_counts[sample["task_id"]])
 
     for todo in all_todos:
         if args.assistant_temperature != 1.0 or args.user_temperature != 1.0:
             todo["assistant_temperature"] = args.assistant_temperature
             todo["user_temperature"] = args.user_temperature
-        todo["steering_controller"] = steering_controller  # None = no steering
+        
+        # if args.inertia_check:
+        #     todo["inertia_check"] = True
+        #     todo["inertia_curvature_threshold"] = args.inertia_curvature_threshold
+        #     todo["inertia_var_slope_threshold"] = args.inertia_var_slope_threshold
+        
+        # todo["steering_controller"] = steering_controller  # None = no steering
 
     random.shuffle(all_todos)
 

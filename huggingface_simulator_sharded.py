@@ -3,13 +3,14 @@ import random
 from typing import Optional
 
 from activation_tracker import ActivationTracker
+from inertia_checker import InertiaChecker
 from utils import print_colored, extract_conversation, date_str
 from utils_log import log_conversation, save_conversation_hidden_states
 from system_agent import SystemAgent
 from user_agent import UserAgent
 from tasks import get_task
 from model_huggingface import generate
-from steering import SteeringController
+from steering.steering import SteeringController
 
 # ──────────────────────────────────────────────
 # HuggingFace generate() — drop-in replacement for model_openai.generate()
@@ -41,6 +42,11 @@ class ConversationSimulatorSharded:
         dataset_fn=None,
         log_folder="logs",
         track_activation=False,
+        
+        # inertia_check=False,
+        # inertia_curvature_threshold: float = -0.2,
+        # inertia_var_slope_threshold: float = 0.0,
+        
         steering_controller=None,
     ):
         self.task_name = sample["task"]
@@ -63,10 +69,17 @@ class ConversationSimulatorSharded:
         self.trace = [{"role": "system", "content": self.system_message, "timestamp": date_str()}]
         # self.trace = [{"role": "system", "content": "You are a helpful assistant.", "timestamp": date_str()}]
         
-        self.activation_tracker = ActivationTracker(layers=[12, 16, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], task=self.task, sample=self.sample["task_id"], track_full_hidden_states=True) if track_activation else None
+        # Llama3.1-8B[12, 16, 20, 24, 28] Qwen3-8B[13, 18, 22, 27, 31] Qwen3-14B[8, 16, 24, 32, 39]
+        self.activation_tracker = ActivationTracker(layers=[12, 16, 20, 24, 28], task=self.task, sample=self.sample["task_id"], track_full_hidden_states=True) if track_activation else None
 
-        self.steering_controller: Optional[SteeringController] = steering_controller
-        self._steer_goal_coords: Optional[dict] = None  # dict[layer→float], set on turn 1
+        # self.inertia_checker = InertiaChecker(
+        #     focus_layer_idx=3,  # layer 20 in [12,16,20,24,28]
+        #     curvature_threshold=inertia_curvature_threshold,
+        #     var_slope_threshold=inertia_var_slope_threshold,
+        # ) if inertia_check else None
+
+        # self.steering_controller: Optional[SteeringController] = steering_controller
+        # self._steer_goal_coords: Optional[dict] = None  # dict[layer→float], set on turn 1
 
     def get_num_turns(self, participant="assistant"):
         return sum(1 for msg in self.trace if msg["role"] == participant)
@@ -78,12 +91,12 @@ class ConversationSimulatorSharded:
         # max_assistant_tokens = 10000 if is_reasoning_model else 1000
         
         # TODO
-        max_assistant_tokens = 1000 # TEMP: set to 512 for testing; can increase to 1000+ for final runs depending on model capacity
+        max_assistant_tokens = 512 # TEMP: set to 512 for testing; can increase to 1000+ for final runs depending on model capacity
 
         is_completed, is_correct, score = False, False, None
         shards = self.sample["shards"]
 
-        while not is_completed:         
+        while not is_completed:
             revealed_shard_ids = set(
                 [msg["content"]["shard_id"] for msg in self.trace
                  if msg["role"] == "log" and msg["content"]["type"] == "shard_revealed"]
@@ -119,16 +132,33 @@ class ConversationSimulatorSharded:
                 max_tokens=max_assistant_tokens,
                 is_first_turn=is_first_turn,
                 activation_tracker=self.activation_tracker,
+                # inertia_checker=self.inertia_checker,
                 return_metadata=True,
-                steering_controller=self.steering_controller,
-                steer_goal_coords=self._steer_goal_coords,
+                # steering_controller=self.steering_controller,
+                # steer_goal_coords=self._steer_goal_coords,
             )
 
+            # Log inertia check result (intervention or skip/pass)
+            # inertia_info = assistant_response_obj.get("inertia_info")
+            # if inertia_info is not None:
+            #     self.trace.append({
+            #         "role": "log",
+            #         "content": {"type": "inertia-check", **inertia_info},
+            #         "timestamp": date_str(),
+            #     })
+            #     if verbose and inertia_info.get("reason") not in ("pass", "skip_too_few_turns"):
+            #         print_colored(
+            #             f"[inertia] {inertia_info['reason']} | "
+            #             f"κ={inertia_info['curvature']:.3f} "
+            #             f"var_slope={inertia_info['var_slope']:.1f}",
+            #             "yellow",
+            #         )
+
             # Propagate per-layer goal coords across turns (set on turn 1, reused after)
-            if self.steering_controller is not None:
-                self._steer_goal_coords = assistant_response_obj.get(
-                    "steer_goal_coords", self._steer_goal_coords
-                )
+            # if self.steering_controller is not None:
+            #     self._steer_goal_coords = assistant_response_obj.get(
+            #         "steer_goal_coords", self._steer_goal_coords
+            #     )
 
             assistant_response = assistant_response_obj["message"]
             assistant_trace_entry = {
@@ -137,10 +167,12 @@ class ConversationSimulatorSharded:
                 "timestamp": date_str(),
                 "cost_usd":  assistant_response_obj["total_usd"],
             }
-            if self.steering_controller is not None:
-                assistant_trace_entry["steer_alphas"]         = assistant_response_obj.get("steer_alphas")
-                assistant_trace_entry["steer_goal_coords"]    = assistant_response_obj.get("steer_goal_coords")
-                assistant_trace_entry["steer_current_coords"] = assistant_response_obj.get("steer_current_coords")
+            
+            # if self.steering_controller is not None:
+            #     assistant_trace_entry["steer_alphas"]         = assistant_response_obj.get("steer_alphas")
+            #     assistant_trace_entry["steer_goal_coords"]    = assistant_response_obj.get("steer_goal_coords")
+            #     assistant_trace_entry["steer_current_coords"] = assistant_response_obj.get("steer_current_coords")
+            
             self.trace.append(assistant_trace_entry)
             if verbose:
                 print_colored(f"[assistant] {assistant_response}", "red")
@@ -186,11 +218,11 @@ class ConversationSimulatorSharded:
             conv_type = "sharded"
             if self.run_with_custom_temperature:
                 conv_type = f"sharded-at{self.assistant_temperature}-ut{self.user_temperature}"
-            activation_result = self.activation_tracker.generate_result() if self.activation_tracker else None
+            # activation_result = self.activation_tracker.generate_result() if self.activation_tracker else None
             conv_id = log_conversation(
                 conv_type, self.task.get_task_name(), self.sample["task_id"],
                 self.dataset_fn, self.assistant_model, self.system_model,
-                self.user_model, self.trace, activation_result, is_correct, score,
+                self.user_model, self.trace, is_correct, score,
                 log_folder=self.log_folder,
             )
             # 同步保存 hidden states

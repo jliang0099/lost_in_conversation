@@ -5,7 +5,8 @@ import time
 from typing import Optional
 import torch
 from activation_tracker import ActivationTracker
-from steering import SteeringController
+from inertia_checker import InertiaChecker
+from steering.steering import SteeringController
 import requests
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
@@ -73,19 +74,20 @@ def _get_activation_model(model_name: str = _ACTIVATION_MODEL):
         
         # 权重主体放GPU1，输入输出层放GPU0（中间激活跟着层走）
         device_map = {
-            "model.embed_tokens": 0,      # 输入embedding在GPU0
-            "model.norm": 0,
-            "lm_head": 0,
-            # 前半层放GPU0（中间激活留在GPU0）
-            **{f"model.layers.{i}": 0 for i in range(0, 15)},
+            "model.embed_tokens": 2,      # 输入embedding在GPU0
+            "model.norm": 2,
+            "lm_head": 2,
+            # 前半层放GPU0（中间激活留在GPU0） 
+            **{f"model.layers.{i}": 0 for i in range(0, 16)},
             # 后半层放GPU1
-            **{f"model.layers.{i}": 1 for i in range(15, 32)},
+            **{f"model.layers.{i}": 1 for i in range(16, 32)},
+            # **{f"model.layers.{i}": 3 for i in range(23, 32)},
         }
         
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch.float16,
-            device_map=device_map,
+            device_map=device_map,  # 自动分配到GPU0、GPU1、GPU2，根据实际显存情况调整
         )
         model.eval()
         
@@ -120,7 +122,7 @@ class vLLM:
 
     def inference(self, messages: list[dict]) -> dict:
         rendered_prompt = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
         )
         payload = {
             "model": self.model,
@@ -172,7 +174,7 @@ def _apply_chat_template(messages: list[dict], tokenizer) -> str:
     """Use tokenizer chat template if available, else fall back to ChatML."""
     if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
         return tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
         )
     parts = [f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>" for m in messages]
     parts.append("<|im_start|>assistant\n")
@@ -216,6 +218,8 @@ class Model:
             )
 
         hs = list(prefill_out.hidden_states)  # list[layer] of (1, seq_len, hidden)
+        
+        # TODO: 检查这个hidden token是否包含了特殊的思考标记（如果有的话），如果有的话可能需要剥离掉再传给tracker，或者让tracker自己处理
 
         if is_first_turn:
             activation_tracker.set_goal(hs)
@@ -241,127 +245,127 @@ class Model:
     # ------------------------------------------------------------------
     # HF steered generation (activation tracking + hook injection in one pass)
     # ------------------------------------------------------------------
-    def _steered_hf_generate(
-        self,
-        messages: list[dict],
-        model_name: str,
-        temperature: float,
-        max_tokens: int,
-        is_first_turn: bool,
-        activation_tracker: Optional[ActivationTracker],
-        steering_controller: SteeringController,
-        steer_goal_coords: Optional[dict],
-    ) -> dict:
-        """
-        Single-pass HF generation with per-layer activation steering.
+    # def _steered_hf_generate(
+    #     self,
+    #     messages: list[dict],
+    #     model_name: str,
+    #     temperature: float,
+    #     max_tokens: int,
+    #     is_first_turn: bool,
+    #     activation_tracker: Optional[ActivationTracker],
+    #     steering_controller: SteeringController,
+    #     steer_goal_coords: Optional[dict],
+    # ) -> dict:
+    #     """
+    #     Single-pass HF generation with per-layer activation steering.
 
-        Each layer in steering_controller.steer_layers independently:
-          - measures its own goal-imprint gap
-          - computes its own proportional alpha
-          - applies its own steering vector during generation
+    #     Each layer in steering_controller.steer_layers independently:
+    #       - measures its own goal-imprint gap
+    #       - computes its own proportional alpha
+    #       - applies its own steering vector during generation
 
-        Steps:
-          1. Prefill-only forward pass to extract hidden states.
-          2. Update activation_tracker (set_goal on turn 1, record after).
-          3. Per layer: extract coord, compute alpha, register hook.
-          4. model.generate() with all hooks active.
-          5. Return response dict with per-layer steering metadata.
-        """
-        model, tokenizer = _get_activation_model(model_name)
+    #     Steps:
+    #       1. Prefill-only forward pass to extract hidden states.
+    #       2. Update activation_tracker (set_goal on turn 1, record after).
+    #       3. Per layer: extract coord, compute alpha, register hook.
+    #       4. model.generate() with all hooks active.
+    #       5. Return response dict with per-layer steering metadata.
+    #     """
+    #     model, tokenizer = _get_activation_model(model_name)
 
-        # Tokenise and move input to the first device in the device_map
-        prompt = _apply_chat_template(messages, tokenizer)
-        inputs = tokenizer(prompt, return_tensors="pt")
-        device = model.model.embed_tokens.weight.device
-        input_ids = inputs["input_ids"].to(device)
-        attention_mask = inputs.get("attention_mask")
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(device)
+    #     # Tokenise and move input to the first device in the device_map
+    #     prompt = _apply_chat_template(messages, tokenizer)
+    #     inputs = tokenizer(prompt, return_tensors="pt")
+    #     device = model.model.embed_tokens.weight.device
+    #     input_ids = inputs["input_ids"].to(device)
+    #     attention_mask = inputs.get("attention_mask")
+    #     if attention_mask is not None:
+    #         attention_mask = attention_mask.to(device)
 
-        # 1. Prefill for hidden-state extraction (no KV cache needed here)
-        with torch.no_grad():
-            prefill_out = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-                use_cache=False,
-            )
-        hs = list(prefill_out.hidden_states)
+    #     # 1. Prefill for hidden-state extraction (no KV cache needed here)
+    #     with torch.no_grad():
+    #         prefill_out = model(
+    #             input_ids=input_ids,
+    #             attention_mask=attention_mask,
+    #             output_hidden_states=True,
+    #             use_cache=False,
+    #         )
+    #     hs = list(prefill_out.hidden_states)
 
-        # 2. Update activation tracker
-        if activation_tracker is not None:
-            if is_first_turn:
-                activation_tracker.set_goal(hs)
-            else:
-                activation_tracker.record_activation(hs)
+    #     # 2. Update activation tracker
+    #     if activation_tracker is not None:
+    #         if is_first_turn:
+    #             activation_tracker.set_goal(hs)
+    #         else:
+    #             activation_tracker.record_activation(hs)
 
-        # 3. Per-layer: extract coords, compute alpha, register hook
-        current_coords: dict[int, float] = steering_controller.extract_coords(hs)
-        alphas_used:    dict[int, float] = {}
-        new_goal_coords: dict[int, float] = {}
-        hook_handles = []
+    #     # 3. Per-layer: extract coords, compute alpha, register hook
+    #     current_coords: dict[int, float] = steering_controller.extract_coords(hs)
+    #     alphas_used:    dict[int, float] = {}
+    #     new_goal_coords: dict[int, float] = {}
+    #     hook_handles = []
 
-        for layer_idx in steering_controller.steer_layers:
-            current = current_coords[layer_idx]
-            if is_first_turn:
-                # Turn 1: record goal position, no steering
-                new_goal_coords[layer_idx] = current
-                alphas_used[layer_idx] = 0.0
-            elif steer_goal_coords is not None:
-                new_goal_coords[layer_idx] = steer_goal_coords[layer_idx]
-                alpha = steering_controller.compute_steer_alpha(
-                    steer_goal_coords[layer_idx], current
-                )
-                alphas_used[layer_idx] = alpha
-                hook_fn = steering_controller.make_hook(alpha, layer_idx)
-                if hook_fn is not None:
-                    hook_handles.append(
-                        model.model.layers[layer_idx].register_forward_hook(hook_fn)
-                    )
-            else:
-                new_goal_coords[layer_idx] = current
-                alphas_used[layer_idx] = 0.0
+    #     for layer_idx in steering_controller.steer_layers:
+    #         current = current_coords[layer_idx]
+    #         if is_first_turn:
+    #             # Turn 1: record goal position, no steering
+    #             new_goal_coords[layer_idx] = current
+    #             alphas_used[layer_idx] = 0.0
+    #         elif steer_goal_coords is not None:
+    #             new_goal_coords[layer_idx] = steer_goal_coords[layer_idx]
+    #             alpha = steering_controller.compute_steer_alpha(
+    #                 steer_goal_coords[layer_idx], current
+    #             )
+    #             alphas_used[layer_idx] = alpha
+    #             hook_fn = steering_controller.make_hook(alpha, layer_idx)
+    #             if hook_fn is not None:
+    #                 hook_handles.append(
+    #                     model.model.layers[layer_idx].register_forward_hook(hook_fn)
+    #                 )
+    #         else:
+    #             new_goal_coords[layer_idx] = current
+    #             alphas_used[layer_idx] = 0.0
 
-        # 4. Autoregressive generation with KV cache
-        gen_kwargs: dict = dict(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=max_tokens,
-            pad_token_id=(
-                tokenizer.pad_token_id
-                if tokenizer.pad_token_id is not None
-                else tokenizer.eos_token_id
-            ),
-        )
-        if temperature > 0:
-            gen_kwargs["do_sample"] = True
-            gen_kwargs["temperature"] = temperature
-        else:
-            gen_kwargs["do_sample"] = False
+    #     # 4. Autoregressive generation with KV cache
+    #     gen_kwargs: dict = dict(
+    #         input_ids=input_ids,
+    #         attention_mask=attention_mask,
+    #         max_new_tokens=max_tokens,
+    #         pad_token_id=(
+    #             tokenizer.pad_token_id
+    #             if tokenizer.pad_token_id is not None
+    #             else tokenizer.eos_token_id
+    #         ),
+    #     )
+    #     if temperature > 0:
+    #         gen_kwargs["do_sample"] = True
+    #         gen_kwargs["temperature"] = temperature
+    #     else:
+    #         gen_kwargs["do_sample"] = False
 
-        model.config.use_cache = True
-        try:
-            with torch.no_grad():
-                output_ids = model.generate(**gen_kwargs)
-        finally:
-            model.config.use_cache = False
-            for h in hook_handles:
-                h.remove()
+    #     model.config.use_cache = True
+    #     try:
+    #         with torch.no_grad():
+    #             output_ids = model.generate(**gen_kwargs)
+    #     finally:
+    #         model.config.use_cache = False
+    #         for h in hook_handles:
+    #             h.remove()
 
-        # 5. Decode new tokens only
-        n_input = input_ids.shape[1]
-        message = tokenizer.decode(
-            output_ids[0, n_input:], skip_special_tokens=True
-        )
+    #     # 5. Decode new tokens only
+    #     n_input = input_ids.shape[1]
+    #     message = tokenizer.decode(
+    #         output_ids[0, n_input:], skip_special_tokens=True
+    #     )
 
-        return {
-            "message":              message,
-            "finish_reason":        "stop",
-            "total_usd":            0.0,
-            "steer_goal_coords":    new_goal_coords,    # dict[layer → float]
-            "steer_current_coords": current_coords,     # dict[layer → float]
-            "steer_alphas":         alphas_used,        # dict[layer → float]
-        }
+    #     return {
+    #         "message":              message,
+    #         "finish_reason":        "stop",
+    #         "total_usd":            0.0,
+    #         "steer_goal_coords":    new_goal_coords,    # dict[layer → float]
+    #         "steer_current_coords": current_coords,     # dict[layer → float]
+    #         "steer_alphas":         alphas_used,        # dict[layer → float]
+    #     }
 
     # ------------------------------------------------------------------
     # Public API
@@ -376,9 +380,12 @@ class Model:
         variables: dict = {},
         is_first_turn: Optional[bool] = None,
         activation_tracker=None,
+        
+        # inertia_checker: Optional[InertiaChecker] = None,
+        
         return_metadata: bool = False,
-        steering_controller: Optional[SteeringController] = None,
-        steer_goal_coords: Optional[dict] = None,
+        # steering_controller: Optional[SteeringController] = None,
+        # steer_goal_coords: Optional[dict] = None,
     ) -> dict:
         messages = format_messages(list(messages), variables)
         max_tokens = max_tokens or 1000
@@ -388,31 +395,34 @@ class Model:
 
         for attempt in range(max_retries):
             try:
-                # print(steering_controller)
-                if steering_controller is not None:
-                    # HF path: activation tracking + steering in one prefill pass
-                    response = self._steered_hf_generate(
-                        messages=messages,
-                        model_name=_ACTIVATION_MODEL,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        is_first_turn=bool(is_first_turn),
-                        activation_tracker=activation_tracker,
-                        steering_controller=steering_controller,
-                        steer_goal_coords=steer_goal_coords,
+                # Original path: optional activation extraction, then vLLM
+                if activation_tracker is not None:
+                    self.record_activations(
+                        messages,
+                        _ACTIVATION_MODEL,
+                        is_first_turn,
+                        activation_tracker,
                     )
-                else:
-                    # Original path: optional activation extraction, then vLLM
-                    if activation_tracker is not None:
-                        self.record_activations(
-                            messages,
-                            _ACTIVATION_MODEL,
-                            is_first_turn,
-                            activation_tracker,
-                        )
-                    response = self.generate_vllm(
-                        messages, model_name, temperature, max_tokens
-                    )
+
+                # Inertia check: if trajectory violates correct mechanical
+                # inertia, inject an intervention into the messages before
+                # passing to the generation backend.
+                generation_messages = messages
+                # inertia_info = None
+                # if inertia_checker is not None and activation_tracker is not None:
+                #     passed, inertia_info = inertia_checker.check(activation_tracker)
+                #     if not passed:
+                #         generation_messages = inertia_checker.inject_into_messages(
+                #             messages, inertia_info["reason"]
+                #         )
+
+                response = self.generate_vllm(
+                    generation_messages, model_name, temperature, max_tokens
+                )
+
+                # if inertia_info is not None:
+                #     response["inertia_info"] = inertia_info
+
                 return response
 
             except Exception as exc:
@@ -434,8 +444,11 @@ class Model:
         result = self.generate(messages, model_name=model, **kwargs)
 
         raw = result["message"]
-        clean = re.sub(r"^```(?:json)?\s*", "", raw.strip())
+        print(f"[DEBUG] raw repr: {repr(raw)}")  # 加这行
+        clean = re.sub(r"^```(?:json)?\s*", "", raw)
         clean = re.sub(r"\s*```$", "", clean)
+        # clean = clean.replace("\\$", "$")
+        print(f"[DEBUG] clean repr: {repr(clean)}")  # 加这行
 
         result["message"] = json.loads(clean)
         return result

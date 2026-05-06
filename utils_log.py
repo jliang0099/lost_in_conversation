@@ -60,7 +60,7 @@ def get_run_counts(conv_type, task_name, assistant_model, dataset_fn, log_folder
     return task_id_counts
 
 
-def log_conversation(conv_type, task_name, task_id, dataset_fn, assistant_model, system_model, user_model, trace, activation_result=None, is_correct=None, score=None, additional_info={}, log_folder=None):
+def log_conversation(conv_type, task_name, task_id, dataset_fn, assistant_model, system_model, user_model, trace, is_correct=None, score=None, additional_info={}, log_folder=None):
     log_files = get_log_files(conv_type, task_name, assistant_model, force_create=True, log_folder=log_folder)
     log_file = log_files[-1]
 
@@ -73,7 +73,7 @@ def log_conversation(conv_type, task_name, task_id, dataset_fn, assistant_model,
     git_version = git.Repo(search_parent_directories=True).head.object.hexsha
 
     conv_id = str(ObjectId())
-    record = {"conv_id": conv_id, "conv_type": conv_type, "task": task_name, "task_id": task_id, "dataset_fn": dataset_fn, "assistant_model": assistant_model, "system_model": system_model, "user_model": user_model, "git_version": git_version, "trace": trace, "activation_result": activation_result, "is_correct": is_correct, "score": score} # , "source_conv_id": source_conv_id
+    record = {"conv_id": conv_id, "conv_type": conv_type, "task": task_name, "task_id": task_id, "dataset_fn": dataset_fn, "assistant_model": assistant_model, "system_model": system_model, "user_model": user_model, "git_version": git_version, "trace": trace, "is_correct": is_correct, "score": score} # , "source_conv_id": source_conv_id
     record.update(additional_info) # sample-specific, for example for recap
     with open(log_file, "a") as f:
         f.write(json.dumps(record)+"\n")
