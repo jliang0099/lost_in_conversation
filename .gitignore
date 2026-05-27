@@ -30,7 +30,7 @@ bld/
 [Bb]in/
 [Oo]bj/
 [Ll]og/
-[Ll]ogs/
+[Ll]ogs/*
 
 # Visual Studio 2015/2017 cache/options directory
 .vs/
@@ -398,3 +398,15 @@ FodyWeavers.xsd
 
 # JetBrains Rider
 *.sln.iml
+
+# Claude
+.claude
+
+# Logs
+logs/*
+!logs/hidden_states/
+logs/hidden_states/*
+!logs/hidden_states/math/
+logs/hidden_states/math/*
+!logs/hidden_states/math/(40-103)sharded-at0-ut0_math_meta-llama_Llama-3.1-8B-Instruct/
+!logs/hidden_states/math/(40-103)sharded-at0-ut0_math_meta-llama_Llama-3.1-8B-Instruct/**

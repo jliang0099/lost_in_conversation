@@ -7,6 +7,7 @@ import torch
 from activation_tracker import ActivationTracker
 from inertia_checker import InertiaChecker
 from steering.steering import SteeringController
+from context_compressor import ContextCompressor
 import requests
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
@@ -381,8 +382,9 @@ class Model:
         is_first_turn: Optional[bool] = None,
         activation_tracker=None,
         
-        # inertia_checker: Optional[InertiaChecker] = None,
-        
+        inertia_checker: Optional[InertiaChecker] = None,
+        context_compressor: Optional[ContextCompressor] = None,
+
         return_metadata: bool = False,
         # steering_controller: Optional[SteeringController] = None,
         # steer_goal_coords: Optional[dict] = None,
@@ -395,6 +397,12 @@ class Model:
 
         for attempt in range(max_retries):
             try:
+                # Context compression — must be first so all downstream steps
+                # (activation tracking, inertia check, vLLM) see the same input.
+                compression_meta = None
+                if context_compressor is not None:
+                    messages, compression_meta = context_compressor.compress(messages)
+
                 # Original path: optional activation extraction, then vLLM
                 if activation_tracker is not None:
                     self.record_activations(
@@ -408,20 +416,23 @@ class Model:
                 # inertia, inject an intervention into the messages before
                 # passing to the generation backend.
                 generation_messages = messages
-                # inertia_info = None
-                # if inertia_checker is not None and activation_tracker is not None:
-                #     passed, inertia_info = inertia_checker.check(activation_tracker)
-                #     if not passed:
-                #         generation_messages = inertia_checker.inject_into_messages(
-                #             messages, inertia_info["reason"]
-                #         )
+                
+                inertia_info = None
+                if inertia_checker is not None and activation_tracker is not None:
+                    passed, inertia_info = inertia_checker.check(activation_tracker)
+                    if not passed:
+                        generation_messages = inertia_checker.inject_into_messages(
+                            messages, inertia_info["reason"]
+                        )
 
                 response = self.generate_vllm(
                     generation_messages, model_name, temperature, max_tokens
                 )
 
-                # if inertia_info is not None:
-                #     response["inertia_info"] = inertia_info
+                if inertia_info is not None:
+                    response["inertia_info"] = inertia_info
+                if compression_meta is not None:
+                    response["compression_meta"] = compression_meta
 
                 return response
 
@@ -444,11 +455,11 @@ class Model:
         result = self.generate(messages, model_name=model, **kwargs)
 
         raw = result["message"]
-        print(f"[DEBUG] raw repr: {repr(raw)}")  # 加这行
+        # print(f"[DEBUG] raw repr: {repr(raw)}")  # 加这行
         clean = re.sub(r"^```(?:json)?\s*", "", raw)
         clean = re.sub(r"\s*```$", "", clean)
         # clean = clean.replace("\\$", "$")
-        print(f"[DEBUG] clean repr: {repr(clean)}")  # 加这行
+        # print(f"[DEBUG] clean repr: {repr(clean)}")  # 加这行
 
         result["message"] = json.loads(clean)
         return result

@@ -73,9 +73,9 @@ class InertiaChecker:
 
     def __init__(
         self,
-        focus_layer_idx: int = 2,
-        curvature_threshold: float = -0.2,
-        var_slope_threshold: float = 0.0,
+        focus_layer_idx: int = 3,
+        curvature_threshold: float = -0.23,
+        # var_slope_threshold: float = 0.0,
     ):
         """
         Args:
@@ -88,7 +88,7 @@ class InertiaChecker:
         """
         self.focus_layer_idx = focus_layer_idx
         self.curvature_threshold = curvature_threshold
-        self.var_slope_threshold = var_slope_threshold
+        # self.var_slope_threshold = var_slope_threshold
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -116,22 +116,22 @@ class InertiaChecker:
         kappa = _cosine(delta_curr, delta_prev)
         return None if math.isnan(kappa) else kappa
 
-    def compute_var_slope(self, turn_states: list[np.ndarray]) -> Optional[float]:
-        """
-        Slope of trace(Cov(h_1, …, h_t)) over prefix length t (t ∈ [2, T]).
-        Uses simple rise/run rather than linregress for speed.
-        Returns None when fewer than 3 turn states are available.
-        """
-        if len(turn_states) < 3:
-            return None
-        hs = np.stack(turn_states)           # (T, D)
-        T = len(hs)
-        trace_covs = [float(hs[:t].var(axis=0).sum()) for t in range(2, T + 1)]
-        if len(trace_covs) < 2:
-            return None
-        # slope over the full available window
-        slope = (trace_covs[-1] - trace_covs[0]) / max(len(trace_covs) - 1, 1)
-        return float(slope)
+    # def compute_var_slope(self, turn_states: list[np.ndarray]) -> Optional[float]:
+    #     """
+    #     Slope of trace(Cov(h_1, …, h_t)) over prefix length t (t ∈ [2, T]).
+    #     Uses simple rise/run rather than linregress for speed.
+    #     Returns None when fewer than 3 turn states are available.
+    #     """
+    #     if len(turn_states) < 3:
+    #         return None
+    #     hs = np.stack(turn_states)           # (T, D)
+    #     T = len(hs)
+    #     trace_covs = [float(hs[:t].var(axis=0).sum()) for t in range(2, T + 1)]
+    #     if len(trace_covs) < 2:
+    #         return None
+    #     # slope over the full available window
+    #     slope = (trace_covs[-1] - trace_covs[0]) / max(len(trace_covs) - 1, 1)
+    #     return float(slope)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -160,26 +160,26 @@ class InertiaChecker:
             return True, info
 
         kappa = self.compute_curvature(turn_states)
-        vslope = self.compute_var_slope(turn_states)
+        # vslope = self.compute_var_slope(turn_states)
 
         info["curvature"] = kappa
-        info["var_slope"] = vslope
+        # info["var_slope"] = vslope
 
         curv_fail = kappa is not None and kappa < self.curvature_threshold
-        var_fail  = vslope is not None and vslope < self.var_slope_threshold
+        # var_fail  = vslope is not None and vslope < self.var_slope_threshold
 
         info["curvature_fail"] = curv_fail
-        info["var_slope_fail"] = var_fail
+        # info["var_slope_fail"] = var_fail
 
-        if curv_fail and var_fail:
-            info["reason"] = "both_fail"
-            return False, info
-        elif curv_fail:
+        # if curv_fail and var_fail:
+        #     info["reason"] = "both_fail"
+            # return False, info
+        if curv_fail:
             info["reason"] = "curvature_fail"
             return False, info
-        elif var_fail:
-            info["reason"] = "var_slope_fail"
-            return False, info
+        # elif var_fail:
+        #     info["reason"] = "var_slope_fail"
+        #     return False, info
 
         info["reason"] = "pass"
         return True, info

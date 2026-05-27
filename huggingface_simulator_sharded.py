@@ -11,6 +11,8 @@ from user_agent import UserAgent
 from tasks import get_task
 from model_huggingface import generate
 from steering.steering import SteeringController
+from context_compressor import ContextCompressor
+from mediator import MediatorAgent
 
 # ──────────────────────────────────────────────
 # HuggingFace generate() — drop-in replacement for model_openai.generate()
@@ -43,11 +45,13 @@ class ConversationSimulatorSharded:
         log_folder="logs",
         track_activation=False,
         
-        # inertia_check=False,
-        # inertia_curvature_threshold: float = -0.2,
+        inertia_check=False,
+        inertia_curvature_threshold: float = -0.23,
         # inertia_var_slope_threshold: float = 0.0,
         
         steering_controller=None,
+        context_compressor=None,
+        mediator: Optional["MediatorAgent"] = None,
     ):
         self.task_name = sample["task"]
         self.task = get_task(self.task_name)
@@ -69,14 +73,18 @@ class ConversationSimulatorSharded:
         self.trace = [{"role": "system", "content": self.system_message, "timestamp": date_str()}]
         # self.trace = [{"role": "system", "content": "You are a helpful assistant.", "timestamp": date_str()}]
         
-        # Llama3.1-8B[12, 16, 20, 24, 28] Qwen3-8B[13, 18, 22, 27, 31] Qwen3-14B[8, 16, 24, 32, 39]
+        # Llama3.1-8B[12, 16, 20, 24, 28] Qwen2.5-14B[10, 20, 30, 40, 46] Qwen3-8B[13, 18, 22, 27, 31] Qwen3-14B[8, 16, 24, 32, 39]
         self.activation_tracker = ActivationTracker(layers=[12, 16, 20, 24, 28], task=self.task, sample=self.sample["task_id"], track_full_hidden_states=True) if track_activation else None
 
-        # self.inertia_checker = InertiaChecker(
-        #     focus_layer_idx=3,  # layer 20 in [12,16,20,24,28]
-        #     curvature_threshold=inertia_curvature_threshold,
-        #     var_slope_threshold=inertia_var_slope_threshold,
-        # ) if inertia_check else None
+        self.context_compressor: Optional[ContextCompressor] = context_compressor
+
+        self.inertia_checker = InertiaChecker(
+            focus_layer_idx=3,  # layer 20 in [12,16,20,24,28]
+            curvature_threshold=inertia_curvature_threshold,
+            # var_slope_threshold=inertia_var_slope_threshold,
+        ) if inertia_check else None
+
+        self.mediator: Optional[MediatorAgent] = mediator
 
         # self.steering_controller: Optional[SteeringController] = steering_controller
         # self._steer_goal_coords: Optional[dict] = None  # dict[layer→float], set on turn 1
@@ -124,15 +132,38 @@ class ConversationSimulatorSharded:
                 if verbose:
                     print_colored(f"[log] shard revealed: {shard_revealed_id}", "blue")
 
-            # 2. Assistant response  ← uses HF generate() instead of OpenAI
+            # 2. (Optional) Mediator rewrites the conversation into a clear instruction
+            if self.mediator is not None:
+                rewritten = self.mediator.rewrite(self.trace)
+                self.trace.append({
+                    "role": "log",
+                    "content": {"type": "mediator-rewrite", "rewritten": rewritten},
+                    "timestamp": date_str(),
+                })
+                if verbose:
+                    print_colored(f"[mediator] {rewritten}", "yellow")
+                # Pass the rewritten instruction as a fresh single-turn conversation
+                generation_messages = [
+                    {"role": "system", "content": self.system_message},
+                    {"role": "user", "content": rewritten},
+                ]
+            else:
+                generation_messages = extract_conversation(self.trace, to_str=False)
+
+            # 3. Assistant response  ← uses HF generate() instead of OpenAI
+            print(f"[DEBUG] generation_messages={generation_messages}")
             assistant_response_obj = generate(
-                messages=extract_conversation(self.trace, to_str=False),
+                messages=generation_messages,
                 model_name=self.assistant_model,
                 temperature=self.assistant_temperature,
                 max_tokens=max_assistant_tokens,
                 is_first_turn=is_first_turn,
                 activation_tracker=self.activation_tracker,
-                # inertia_checker=self.inertia_checker,
+
+                inertia_checker=self.inertia_checker,
+
+                context_compressor=self.context_compressor,
+
                 return_metadata=True,
                 # steering_controller=self.steering_controller,
                 # steer_goal_coords=self._steer_goal_coords,
@@ -197,6 +228,8 @@ class ConversationSimulatorSharded:
                     assert type(evaluation_return) is dict and ("score" in evaluation_return or "is_correct" in evaluation_return)
                     is_correct = evaluation_return.get("is_correct", None)
                     score = evaluation_return.get("score", None)
+                    # if is_last_turn:
+                        # print(f"[DEBUG] is_correct={is_correct}  score={score}  evaluation_return={evaluation_return}")
 
                 if score == 1.0 and not is_correct:
                     is_correct = True

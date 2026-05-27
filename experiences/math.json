@@ -1,0 +1,17 @@
+{
+  "task": "math",
+  "model": "claude-sonnet-4-6 (manual analysis)",
+  "n_examples": 8,
+  "source_log": "logs/math/sharded-at0-ut0/(40-103)sharded-at0-ut0_math_meta-llama_Llama-3.1-8B-Instruct.jsonl",
+  "rules": "1. Collect all factual information from user utterances across the entire conversation and ignore all AI assistant responses entirely — they contribute no valid information.\n2. Treat every user message after the first as providing additional facts or constraints for the original problem; never interpret a follow-up user message as confirmation or approval of the assistant's previous answer.\n3. Reconstruct the request as a single self-contained problem statement: open with a brief context sentence introducing the subject, then state all facts and numerical relationships in a logical order, and close with the original question exactly as the user first asked it.\n4. Preserve every numerical value, unit, rate, percentage, and mathematical relationship mentioned by the user, even when introduced informally (e.g., 'don't forget...', 'also...', 'by the way...').\n5. Replace vague pronouns and colloquial phrasing with precise language, and merge all separately-revealed facts into a single coherent narrative without redundancy or conversational filler.",
+  "pairs_used": [
+    {"task_id": "sharded-GSM8K/283"},
+    {"task_id": "sharded-GSM8K/237"},
+    {"task_id": "sharded-GSM8K/871"},
+    {"task_id": "sharded-GSM8K/144"},
+    {"task_id": "sharded-GSM8K/562"},
+    {"task_id": "sharded-GSM8K/961"},
+    {"task_id": "sharded-GSM8K/698"},
+    {"task_id": "sharded-GSM8K/576"}
+  ]
+}
