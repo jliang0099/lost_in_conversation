@@ -1,7 +1,4 @@
-import json
-import random
 from typing import Optional
-
 from activation_tracker import ActivationTracker
 from inertia_checker import InertiaChecker
 from utils import print_colored, extract_conversation, date_str
@@ -10,27 +7,9 @@ from system_agent import SystemAgent
 from user_agent import UserAgent
 from tasks import get_task
 from model_huggingface import generate
-from steering.steering import SteeringController
-from context_compressor import ContextCompressor
-from mediator import MediatorAgent
-
-# ──────────────────────────────────────────────
-# HuggingFace generate() — drop-in replacement for model_openai.generate()
-# Supports two backends:
-#   1. LOCAL  – transformers pipeline on GPU (default, recommended for V100)
-#   2. API    – HuggingFace Inference API (set HF_BACKEND=api or pass backend="api")
-# ──────────────────────────────────────────────
-
-import os
-import time
+from lu_bandit.agent import LUBandit
+from ce_methods import CEMethod
 from typing import Optional
-
-HF_BACKEND = os.environ.get("HF_BACKEND", "local")   # "local" | "api"
-
-# ──────────────────────────────────────────────
-# ConversationSimulatorSharded (HF version)
-# Identical logic to the original; only the import differs.
-# ──────────────────────────────────────────────
 
 class ConversationSimulatorSharded:
     def __init__(
@@ -44,14 +23,10 @@ class ConversationSimulatorSharded:
         dataset_fn=None,
         log_folder="logs",
         track_activation=False,
-        
-        inertia_check=False,
-        inertia_curvature_threshold: float = -0.23,
-        # inertia_var_slope_threshold: float = 0.0,
-        
-        steering_controller=None,
-        context_compressor=None,
-        mediator: Optional["MediatorAgent"] = None,
+        conv_type: Optional[str] = None,
+
+        lu_bandit: Optional["LUBandit"] = None,
+        ce_method: Optional["CEMethod"] = None,
     ):
         self.task_name = sample["task"]
         self.task = get_task(self.task_name)
@@ -69,25 +44,26 @@ class ConversationSimulatorSharded:
         self.run_with_custom_temperature = assistant_temperature != 1.0 or user_temperature != 1.0
         self.assistant_temperature = assistant_temperature
         self.user_temperature = user_temperature
-
+        
+        # CE-1: For CE methods that modify the system prompt, apply augmentation before the conversation starts.
+        if ce_method is not None:
+            self.system_message = ce_method.augment_system_message(self.system_message, self.sample)
+        self.ce_method: Optional[CEMethod] = ce_method
+        self._conv_type_override = conv_type  # full conv_type including CE prefix if any
+        
         self.trace = [{"role": "system", "content": self.system_message, "timestamp": date_str()}]
-        # self.trace = [{"role": "system", "content": "You are a helpful assistant.", "timestamp": date_str()}]
+        
+        # CE-2a: For CE methods that provide demonstration messages, get them once at the start (e.g. for in-context learning or iterative feedback methods like CoT or Reflexion).
+        self._demo_messages = ce_method.get_demo_messages(self.sample) if ce_method is not None else []
         
         # Llama3.1-8B[12, 16, 20, 24, 28] Qwen2.5-14B[10, 20, 30, 40, 46] Qwen3-8B[13, 18, 22, 27, 31] Qwen3-14B[8, 16, 24, 32, 39]
         self.activation_tracker = ActivationTracker(layers=[12, 16, 20, 24, 28], task=self.task, sample=self.sample["task_id"], track_full_hidden_states=True) if track_activation else None
 
-        self.context_compressor: Optional[ContextCompressor] = context_compressor
+        self.lu_bandit: Optional[LUBandit] = lu_bandit
 
-        self.inertia_checker = InertiaChecker(
-            focus_layer_idx=3,  # layer 20 in [12,16,20,24,28]
-            curvature_threshold=inertia_curvature_threshold,
-            # var_slope_threshold=inertia_var_slope_threshold,
-        ) if inertia_check else None
-
-        self.mediator: Optional[MediatorAgent] = mediator
-
-        # self.steering_controller: Optional[SteeringController] = steering_controller
-        # self._steer_goal_coords: Optional[dict] = None  # dict[layer→float], set on turn 1
+        # InertiaChecker runs whenever activation tracking is on — independent of LUBandit.
+        # goal_drift measures whether CE methods preserve goal alignment across turns.
+        self.inertia_checker = InertiaChecker(focus_layer_idx=3) if track_activation else None
 
     def get_num_turns(self, participant="assistant"):
         return sum(1 for msg in self.trace if msg["role"] == participant)
@@ -118,7 +94,6 @@ class ConversationSimulatorSharded:
             is_first_turn = self.get_num_turns("assistant") == 0
             is_last_turn = len(revealed_shard_ids) == len(shards) - 1
 
-            # 1. User response
             user_response, shard_revealed_id, cost_usd = self.user_agent.generate_response(
                 self.trace, self.sample, temperature=self.user_temperature
             )
@@ -131,27 +106,39 @@ class ConversationSimulatorSharded:
                 self.trace.append({"role": "log", "content": {"type": "shard_revealed", "shard_id": shard_revealed_id}, "timestamp": date_str()})
                 if verbose:
                     print_colored(f"[log] shard revealed: {shard_revealed_id}", "blue")
+                    
+            generation_messages = extract_conversation(self.trace, to_str=False)
+            
+            # CE-2b: For CE methods that provide demonstration messages, inject them into the generation messages at the appropriate position (e.g. after the system prompt).
+            if self._demo_messages:
+                sys_msgs = [m for m in generation_messages if m["role"] == "system"]
+                real_msgs = [m for m in generation_messages if m["role"] != "system"]
+                generation_messages = sys_msgs + self._demo_messages + real_msgs
 
-            # 2. (Optional) Mediator rewrites the conversation into a clear instruction
-            if self.mediator is not None:
-                rewritten = self.mediator.rewrite(self.trace)
-                self.trace.append({
-                    "role": "log",
-                    "content": {"type": "mediator-rewrite", "rewritten": rewritten},
-                    "timestamp": date_str(),
-                })
-                if verbose:
-                    print_colored(f"[mediator] {rewritten}", "yellow")
-                # Pass the rewritten instruction as a fresh single-turn conversation
-                generation_messages = [
-                    {"role": "system", "content": self.system_message},
-                    {"role": "user", "content": rewritten},
-                ]
-            else:
-                generation_messages = extract_conversation(self.trace, to_str=False)
+            # CE-3: For CE methods that modify the generation messages (e.g. compression methods that shorten conversation history), apply transformation before generation.
+            if self.ce_method is not None:
+                generation_messages = self.ce_method.transform_generation_messages(
+                    generation_messages, n_demo_messages=len(self._demo_messages)
+                )
 
-            # 3. Assistant response  ← uses HF generate() instead of OpenAI
-            print(f"[DEBUG] generation_messages={generation_messages}")
+            # LUBandit: select behavioral mode, inject hint into messages
+            bandit_meta: dict = {}
+            if self.lu_bandit is not None:
+                _behavior, generation_messages, bandit_meta = self.lu_bandit.decide(
+                    tracker=self.activation_tracker,
+                    inertia_checker=self.inertia_checker,
+                    messages=generation_messages,
+                    n_total_turns=len(shards),
+                    task_type=self.task_name,
+                )
+                if verbose and _behavior != "neutral":
+                    print_colored(
+                        f"[lu_bandit] behavior={_behavior}  "
+                        f"ucb={bandit_meta.get('ucb_score', 0):.3f}",
+                        "cyan",
+                    )
+
+            print("[debug] messages fed to generate_fn:", generation_messages)
             assistant_response_obj = generate(
                 messages=generation_messages,
                 model_name=self.assistant_model,
@@ -159,63 +146,70 @@ class ConversationSimulatorSharded:
                 max_tokens=max_assistant_tokens,
                 is_first_turn=is_first_turn,
                 activation_tracker=self.activation_tracker,
-
-                inertia_checker=self.inertia_checker,
-
-                context_compressor=self.context_compressor,
-
                 return_metadata=True,
-                # steering_controller=self.steering_controller,
-                # steer_goal_coords=self._steer_goal_coords,
             )
 
-            # Log inertia check result (intervention or skip/pass)
-            # inertia_info = assistant_response_obj.get("inertia_info")
-            # if inertia_info is not None:
-            #     self.trace.append({
-            #         "role": "log",
-            #         "content": {"type": "inertia-check", **inertia_info},
-            #         "timestamp": date_str(),
-            #     })
-            #     if verbose and inertia_info.get("reason") not in ("pass", "skip_too_few_turns"):
-            #         print_colored(
-            #             f"[inertia] {inertia_info['reason']} | "
-            #             f"κ={inertia_info['curvature']:.3f} "
-            #             f"var_slope={inertia_info['var_slope']:.1f}",
-            #             "yellow",
-            #         )
-
-            # Propagate per-layer goal coords across turns (set on turn 1, reused after)
-            # if self.steering_controller is not None:
-            #     self._steer_goal_coords = assistant_response_obj.get(
-            #         "steer_goal_coords", self._steer_goal_coords
-            #     )
-
             assistant_response = assistant_response_obj["message"]
+
+            # CE-4: For CE methods that apply post-processing to the assistant response (e.g. self-refinement methods that call generate() again), apply post-processing after generation.
+            if self.ce_method is not None:
+                assistant_response = self.ce_method.post_process_response(
+                    assistant_response=assistant_response,
+                    generation_messages=generation_messages,
+                    generate_fn=generate,
+                    model_name=self.assistant_model,
+                    temperature=self.assistant_temperature,
+                    max_tokens=max_assistant_tokens,
+                )
+            
+            # CE-5: Record CE token usage in the trace for visibility and logging.
+            ce_tokens = self.ce_method.last_turn_ce_tokens if self.ce_method is not None else {}
+            
             assistant_trace_entry = {
                 "role":      "assistant",
                 "content":   assistant_response,
                 "timestamp": date_str(),
                 "cost_usd":  assistant_response_obj["total_usd"],
+                "prompt_tokens":        assistant_response_obj.get("prompt_tokens", 0),
+                "completion_tokens":    assistant_response_obj.get("completion_tokens", 0),
+                "ce_prompt_tokens":     ce_tokens.get("prompt_tokens", 0),
+                "ce_completion_tokens": ce_tokens.get("completion_tokens", 0),
             }
-            
-            # if self.steering_controller is not None:
-            #     assistant_trace_entry["steer_alphas"]         = assistant_response_obj.get("steer_alphas")
-            #     assistant_trace_entry["steer_goal_coords"]    = assistant_response_obj.get("steer_goal_coords")
-            #     assistant_trace_entry["steer_current_coords"] = assistant_response_obj.get("steer_current_coords")
-            
+            if bandit_meta:
+                assistant_trace_entry["bandit_meta"] = bandit_meta
+
+            #TODO Independently intertia checker
+            if self.activation_tracker and self.inertia_checker:
+                assistant_trace_entry["inertia"] = self.inertia_checker.summary(
+                    self.activation_tracker
+                )
+
             self.trace.append(assistant_trace_entry)
             if verbose:
                 print_colored(f"[assistant] {assistant_response}", "red")
 
-            # 3. System verification
+            # LUBandit: observe outcome — computes quality, stages reward
+            if self.lu_bandit is not None:
+                kappa_now = self.lu_bandit.current_kappa(
+                    self.activation_tracker, self.inertia_checker
+                )
+                messages_with_response = extract_conversation(self.trace, to_str=False)
+                self.lu_bandit.observe(
+                    messages_after=messages_with_response,
+                    generate_fn=generate,
+                    kappa_after=kappa_now,
+                )
+
+            # System verification
             system_verification_response, verification_cost_usd = self.system_agent.verify_system_response(self.trace)
             self.trace.append({"role": "log", "content": {"type": "system-verification", "response": system_verification_response}, "timestamp": date_str(), "cost_usd": verification_cost_usd})
             if verbose:
                 print_colored(f"[log] system verification: {system_verification_response}", "blue")
 
-            if system_verification_response["response_type"] == "answer_attempt":
-                # 4. Evaluate
+            response_type = system_verification_response["response_type"]
+
+            if response_type == "answer_attempt":
+                # Evaluate
                 extracted_answer = self.system_agent.extract_answer(self.trace)
                 is_correct, score = None, None
 
@@ -224,12 +218,10 @@ class ConversationSimulatorSharded:
                     score = 0.0
                 else:
                     evaluation_return = self.task.evaluator_function(extracted_answer, self.sample)
-                    
+
                     assert type(evaluation_return) is dict and ("score" in evaluation_return or "is_correct" in evaluation_return)
                     is_correct = evaluation_return.get("is_correct", None)
                     score = evaluation_return.get("score", None)
-                    # if is_last_turn:
-                        # print(f"[DEBUG] is_correct={is_correct}  score={score}  evaluation_return={evaluation_return}")
 
                 if score == 1.0 and not is_correct:
                     is_correct = True
@@ -238,27 +230,83 @@ class ConversationSimulatorSharded:
                 if verbose:
                     print_colored(f"[log] answer evaluation:\n```{extracted_answer}\n```\n({'correct' if is_correct else 'incorrect'}; score: {score})", "blue")
 
+                # LUBandit: record verification + alignment bonus
+                if self.lu_bandit is not None:
+                    self.lu_bandit.note_verification(response_type, extracted_answer)
+
                 if is_correct:
                     is_completed = True
+                    # LUBandit end-of-episode: flush last reward + task score bonus
+                    if self.lu_bandit is not None:
+                        kappa_final = self.lu_bandit.current_kappa(
+                            self.activation_tracker, self.inertia_checker
+                        )
+                        self.lu_bandit.end_episode(
+                            final_task_score=score,
+                            kappa_final=kappa_final,
+                        )
+                        self.lu_bandit.save_if_configured()
                     self.trace.append({"role": "log", "content": {"type": "conversation-completed", "is_correct": is_correct}, "timestamp": date_str()})
                     if verbose:
                         print_colored(f"[log] conversation completed: {is_correct}; score: {score}", "blue")
 
-            elif system_verification_response["response_type"] in ["clarification", "discussion"]:
-                continue
+            else:
+                # Non-answer turn: still record response_type for bandit state + alignment
+                if self.lu_bandit is not None:
+                    self.lu_bandit.note_verification(response_type)
+                if response_type in ["clarification", "discussion"]:
+                    continue
             
+        # LUBandit end-of-episode for unsolved conversations (flush any staged reward)
+        if self.lu_bandit is not None and self.lu_bandit.reward_computer.has_pending():
+            kappa_final = self.lu_bandit.current_kappa(
+                self.activation_tracker, self.inertia_checker
+            )
+            self.lu_bandit.end_episode(final_task_score=score, kappa_final=kappa_final)
+            self.lu_bandit.save_if_configured()
+
+        assistant_turns = [m for m in self.trace if m["role"] == "assistant"]
+        total_prompt_tokens      = sum(m.get("prompt_tokens", 0)        for m in assistant_turns)
+        total_completion_tokens  = sum(m.get("completion_tokens", 0)    for m in assistant_turns)
+        total_ce_prompt_tokens   = sum(m.get("ce_prompt_tokens", 0)     for m in assistant_turns)
+        total_ce_completion_tokens = sum(m.get("ce_completion_tokens", 0) for m in assistant_turns)
+        self.trace.append({
+            "role": "log",
+            "content": {
+                "type": "token-usage",
+                "prompt_tokens":            total_prompt_tokens,
+                "completion_tokens":        total_completion_tokens,
+                "total_tokens":             total_prompt_tokens + total_completion_tokens,
+                "ce_prompt_tokens":         total_ce_prompt_tokens,
+                "ce_completion_tokens":     total_ce_completion_tokens,
+                "ce_total_tokens":          total_ce_prompt_tokens + total_ce_completion_tokens,
+                "grand_total_tokens":       (total_prompt_tokens + total_completion_tokens
+                                             + total_ce_prompt_tokens + total_ce_completion_tokens),
+            },
+            "timestamp": date_str(),
+        })
+        if verbose:
+            print_colored(
+                f"[log] token usage — main: {total_prompt_tokens}p/{total_completion_tokens}c"
+                + (f", CE overhead: {total_ce_prompt_tokens}p/{total_ce_completion_tokens}c"
+                   if total_ce_prompt_tokens or total_ce_completion_tokens else ""),
+                "blue",
+            )
+
         if save_log:
-            conv_type = "sharded"
-            if self.run_with_custom_temperature:
+            if self._conv_type_override is not None:
+                conv_type = self._conv_type_override
+            elif self.run_with_custom_temperature:
                 conv_type = f"sharded-at{self.assistant_temperature}-ut{self.user_temperature}"
-            # activation_result = self.activation_tracker.generate_result() if self.activation_tracker else None
+            else:
+                conv_type = "sharded"
             conv_id = log_conversation(
                 conv_type, self.task.get_task_name(), self.sample["task_id"],
                 self.dataset_fn, self.assistant_model, self.system_model,
                 self.user_model, self.trace, is_correct, score,
                 log_folder=self.log_folder,
             )
-            # 同步保存 hidden states
+            # Activation tracker log
             if self.activation_tracker:
                 save_conversation_hidden_states(
                     conv_id, conv_type, self.task.get_task_name(),
@@ -266,56 +314,3 @@ class ConversationSimulatorSharded:
                     log_folder=self.log_folder
                 )
         return is_correct, score
-
-
-# ──────────────────────────────────────────────
-# CLI entry point
-# ──────────────────────────────────────────────
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="ConversationSimulatorSharded with HuggingFace models")
-    parser.add_argument("--task", type=str, default="math")
-    parser.add_argument("--assistant_model", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct",
-                        help="HuggingFace model ID for the assistant")
-    parser.add_argument("--system_model", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct",
-                        help="HuggingFace model ID for the system/verifier agent")
-    parser.add_argument("--user_model", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct",
-                        help="HuggingFace model ID for the user agent")
-    parser.add_argument("--backend", type=str, default=None, choices=["local", "api"],
-                        help="HF backend: 'local' (transformers) or 'api' (HF Inference API). "
-                             "Overrides HF_BACKEND env var.")
-    parser.add_argument("--dataset", type=str, default="data/sharded_instructions_600.json")
-    
-    parser.add_argument("--track_activation", default=True, help="Whether to track activations (for local models only)")
-    
-    args = parser.parse_args()
-
-    # Set backend via env var so UserAgent / SystemAgent also pick it up if they call generate()
-    if args.backend:
-        os.environ["HF_BACKEND"] = args.backend
-
-    with open(args.dataset, "r") as f:
-        data = json.load(f)
-
-    # data = [d for d in data if d["task"] == args.task]
-    data = [d for d in data if d["task"] == args.task]
-    
-    for i in range(15):
-        count = [d for d in data if len(d["shards"]) == i]  # TEMP: only test on 3-shard tasks for now
-        print(f"Tasks with {i} shards: {len(count)}")
-
-    # sample = random.choice(data)
-    # print(f"[main] Running task='{args.task}', sample id='{sample.get('task_id', '?')}'")
-
-    # simulator = ConversationSimulatorSharded(
-    #     sample=sample,
-    #     assistant_model=args.assistant_model,
-    #     system_model=args.system_model,
-    #     user_model=args.user_model,
-    #     dataset_fn=args.dataset,
-    #     hf_backend=args.backend,
-    #     track_activation=args.track_activation,
-    # )
-    # is_correct, score = simulator.run(verbose=True, save_log=True)

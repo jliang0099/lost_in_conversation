@@ -9,18 +9,16 @@ from simulator_snowball import ConversationSimulatorSnowball
 from concurrent.futures import ThreadPoolExecutor
 from utils_log import get_run_counts
 from collections import Counter
-from steering.steering import SteeringController
-from context_compressor import ContextCompressor
-from mediator import MediatorAgent
+from lu_bandit.agent import LUBandit
+from ce_methods import build_ce_method, CHOICES as CE_CHOICES
 
 def run_simulation(todo):
     dataset_fn = todo["dataset_fn"]
     try:
         assistant_temp = todo.get("assistant_temperature", 0)
         user_temp = todo.get("user_temperature", 0)
-        # steering_controller = todo.get("steering_controller")
 
-        if todo["conv_type"].startswith("sharded"):
+        if "sharded" in todo["conv_type"]:
             conversation_simulator = ConversationSimulatorSharded(
                 todo["sample"],
                 assistant_model=todo["assistant_model"],
@@ -31,14 +29,10 @@ def run_simulation(todo):
                 dataset_fn=dataset_fn,
                 log_folder=args.log_folder,
                 track_activation=True,
+                conv_type=todo["conv_type"],
 
-                inertia_check=todo.get("inertia_check", False),
-                inertia_curvature_threshold=todo.get("inertia_curvature_threshold", -0.23),
-                # inertia_var_slope_threshold=todo.get("inertia_var_slope_threshold", 0.0),
-
-                context_compressor=todo.get("context_compressor", None),
-                mediator=todo.get("mediator", None),
-                # steering_controller=steering_controller
+                lu_bandit=todo.get("lu_bandit", None),
+                ce_method=todo.get("ce_method", None),
             )
         elif todo["conv_type"].startswith("snowball"):
             conversation_simulator = ConversationSimulatorSnowball(
@@ -88,65 +82,80 @@ if __name__ == '__main__':
     parser.add_argument("--category_ids_file", type=str, default="category_task_ids.json",
                         help="JSON file produced by: python failure_classifier.py ... --export-task-ids FILE")
 
-    parser.add_argument("--inertia_check", action="store_true", default=False,
-                        help="Enable inertia-based prompt intervention (curvature + variance checks)")
-    parser.add_argument("--inertia_curvature_threshold", type=float, default=-0.23,
-                        help="Temporal curvature κ below this triggers intervention (default: -0.2)")
-
-    parser.add_argument("--context_compress", action="store_true", default=False,
-                        help="Enable LLMLingua-2 context compression before generation")
-    parser.add_argument("--compress_rate", type=float, default=0.5,
-                        help="Target compression rate for LLMLingua-2 (default: 0.5)")
-    parser.add_argument("--compress_keep_last_n_turns", type=int, default=1,
-                        help="Number of recent turns to keep verbatim (default: 1)")
-
-    parser.add_argument("--mediator", action="store_true", default=False,
-                        help="Enable Mediator-Assistant framework (requires experiences/{task}.json)")
-    parser.add_argument("--mediator_model", type=str, default=None,
-                        help="Model for the Mediator LLM call (defaults to --system_model)")
+    # ── CE Methods ────────────────────────────────────────────────────────────
+    parser.add_argument("--ce_method", type=str, default="none", choices=CE_CHOICES,
+                        help="Context Engineering method to apply (default: none)")
     
-    # parser.add_argument("--inertia_var_slope_threshold", type=float, default=0.0,
-    #                     help="Variance slope below this triggers intervention (default: 0.0)")
+    parser.add_argument("--fewshot_k", type=int, default=3,
+                        help="Number of few-shot demo examples (used when --ce_method fewshot)")
+    parser.add_argument("--fewshot_log", type=str,
+                        default="logs/math/sharded-at0-ut0/(260-428)sharded-at0-ut0_math_meta-llama_Llama-3.1-8B-Instruct.jsonl",
+                        help="Demo log file for FewShotCE (task_ids must not overlap with evaluation set)")
+    
+    parser.add_argument("--compress_model", type=str, default='meta-llama/Llama-3.1-8B-Instruct',
+                        help="Model used to generate the conversation summary "
+                             "(context_compression). Defaults to --system_model.")
+    parser.add_argument("--compress_keep_last_n", type=int, default=2,
+                        help="Recent user/assistant turn pairs kept verbatim (context_compression)")
+    parser.add_argument("--compress_min_history", type=int, default=2,
+                        help="Minimum history turns before compression kicks in (context_compression)")
+    parser.add_argument("--compress_max_tokens", type=int, default=256,
+                        help="Token budget for the generated summary (context_compression)")
 
-    # parser.add_argument("--steering_artifacts_dir", type=str, default=None,
-    #                     help="Directory containing layer_L.pt steering artifacts. "
-    #                          "If omitted, no steering is applied.")
-    # parser.add_argument("--steer_alpha", type=float, default=0.5,
-    #                     help="Base proportional steering strength (used when --steering_artifacts_dir is set).")
+    # ── LUBandit ──────────────────────────────────────────────────────────────
+    parser.add_argument("--lu_bandit", action="store_true", default=False,
+                        help="Enable LUBandit adaptive compression policy")
+    parser.add_argument("--bandit_alpha", type=float, default=1.0,
+                        help="LinUCB exploration coefficient (default: 1.0)")
+    parser.add_argument("--bandit_epsilon", type=float, default=0.1,
+                        help="ε-greedy override on top of UCB (0 = pure UCB)")
+    parser.add_argument("--bandit_lambda_drift", type=float, default=0.5,
+                        help="Curvature-drift penalty weight λ_drift (default: 0.5)")
+    parser.add_argument("--bandit_final_bonus", type=float, default=1.0,
+                        help="Task-score bonus weight applied at end of episode (default: 1.0)")
+    parser.add_argument("--bandit_checkpoint", type=str, default=None,
+                        help="Path to save/load LinUCB weights (pkl). Loaded if exists, saved after each episode.")
+    parser.add_argument("--bandit_discriminator_model", type=str, default=None,
+                        help="Model for vLLM quality discriminator (defaults to --system_model)")
+    parser.add_argument("--bandit_discriminator_mode", type=str, default="none",
+                        choices=["none", "prompt", "logprob"],
+                        help="Discriminator mode: 'none' (skip), 'prompt' (LLM scoring), 'logprob'")
 
     args = parser.parse_args()
 
-    # Build ContextCompressor once; shared (read-only) across all worker threads.
-    context_compressor = None
-    if args.context_compress:
-        context_compressor = ContextCompressor(
-            rate=args.compress_rate,
-            keep_last_n_turns=args.compress_keep_last_n_turns,
+    # Build CE method once; stateless, safe to share across threads.
+    _ce_kwargs = {}
+    if args.ce_method == "fewshot":
+        _ce_kwargs = {"log_path": args.fewshot_log, "k": args.fewshot_k}
+    elif args.ce_method == "context_compression":
+        _ce_kwargs = {
+            "model_name":        args.compress_model or args.system_model,
+            "keep_last_n_turns": args.compress_keep_last_n,
+            "min_history_turns": args.compress_min_history,
+            "summary_max_tokens": args.compress_max_tokens,
+        }
+    ce_method = build_ce_method(args.ce_method, **_ce_kwargs)
+    if ce_method is not None:
+        print(f"[ce_method] {ce_method.name}")
+
+    # Build LUBandit once; shared across worker threads (bandit weights are
+    # updated inside each thread — use --N_workers 1 for correct online learning).
+    lu_bandit = None
+    if args.lu_bandit:
+        discriminator_model = args.bandit_discriminator_model or args.system_model
+        lu_bandit = LUBandit.from_config(
+            alpha=args.bandit_alpha,
+            epsilon=args.bandit_epsilon,
+            lambda_drift=args.bandit_lambda_drift,
+            final_bonus=args.bandit_final_bonus,
+            discriminator_model=discriminator_model,
+            discriminator_mode=args.bandit_discriminator_mode,
+            checkpoint_path=args.bandit_checkpoint,
         )
-        print(f"[context_compress] rate={args.compress_rate}  keep_last_n_turns={args.compress_keep_last_n_turns}")
-
-    # Build MediatorAgent once per task; shared across worker threads.
-    # MediatorAgent is stateless after init, so sharing is safe.
-    mediator_map = {}  # task -> MediatorAgent
-    if args.mediator:
-        mediator_model = args.mediator_model or args.system_model
-        for task in args.tasks:
-            try:
-                mediator_map[task] = MediatorAgent(
-                    task=task,
-                    model=mediator_model,
-                    experiences_dir="experiences",
-                )
-                print(f"[mediator] loaded experiences for task='{task}' using model='{mediator_model}'")
-            except FileNotFoundError as e:
-                print(f"[mediator] WARNING: {e} — mediator disabled for task='{task}'")
-
-    # Build SteeringController once; shared (read-only) across all worker threads.
-    # if args.steering_artifacts_dir is not None:
-    #     steering_controller = SteeringController(args.steering_artifacts_dir, base_alpha=args.steer_alpha)
-    #     print(f"[steering] artifacts_dir={args.steering_artifacts_dir}  base_alpha={args.steer_alpha}")
-    # else:
-    #     steering_controller = None
+        print(
+            f"[lu_bandit] alpha={args.bandit_alpha}  epsilon={args.bandit_epsilon}  "
+            f"actions=neutral/explore/commit/challenge  discriminator={args.bandit_discriminator_mode}"
+        )
 
     # windows fix dataset_file to be unix format
     dataset_fn = args.dataset_file
@@ -179,15 +188,15 @@ if __name__ == '__main__':
         samples = [s for s in samples if s["task_id"] in allowed_ids]
         print(f"Filtered to failure_category='{args.failure_category}': {len(samples)} samples")
 
-    # samples = [sample for sample in samples if len(sample["shards"]) >= 6]
-
     print(f"Loaded {len(samples)} samples")
     random.shuffle(samples)
     all_todos = []
 
     sharded_extra = f"-at{args.assistant_temperature}-ut{args.user_temperature}" if args.assistant_temperature != 1.0 or args.user_temperature != 1.0 else ""
     st_extra = f"-t{args.assistant_temperature}" if args.assistant_temperature != 1.0 else ""
-    sharded_ct, full_ct, concat_ct, snowball_ct = f"sharded{sharded_extra}", f"full{st_extra}", f"concat{st_extra}", f"snowball{sharded_extra}"
+    ce_prefix = f"{ce_method.name}-" if ce_method is not None else ""
+    sharded_ct = f"{ce_prefix}sharded{sharded_extra}"
+    full_ct, concat_ct, snowball_ct = f"full{st_extra}", f"concat{st_extra}", f"snowball{sharded_extra}"
 
     all_tasks = list(set([sample["task"] for sample in samples]))
     for assistant_model in args.models:
@@ -213,20 +222,11 @@ if __name__ == '__main__':
             todo["assistant_temperature"] = args.assistant_temperature
             todo["user_temperature"] = args.user_temperature
         
-        if args.inertia_check:
-            todo["inertia_check"] = True
-            todo["inertia_curvature_threshold"] = args.inertia_curvature_threshold
+        if lu_bandit is not None:
+            todo["lu_bandit"] = lu_bandit
 
-        if context_compressor is not None:
-            todo["context_compressor"] = context_compressor
-
-        if mediator_map:
-            task = todo["sample"]["task"]
-            if task in mediator_map:
-                todo["mediator"] = mediator_map[task]
-        #     todo["inertia_var_slope_threshold"] = args.inertia_var_slope_threshold
-        
-        # todo["steering_controller"] = steering_controller  # None = no steering
+        if ce_method is not None:
+            todo["ce_method"] = ce_method
 
     random.shuffle(all_todos)
 

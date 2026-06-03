@@ -1,41 +1,21 @@
-import os
+from pyexpat.errors import messages
 import re
 import json
-import time
 from typing import Optional
 import torch
 from activation_tracker import ActivationTracker
-from inertia_checker import InertiaChecker
-from steering.steering import SteeringController
-from context_compressor import ContextCompressor
 import requests
 from transformers import AutoTokenizer, AutoModelForCausalLM
-
-DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 
 # ---------------------------------------------------------------------------
 # vLLM routing table
 #   key   : model name (must match what callers pass as model_name)
 #   value : (host, port) of the corresponding vLLM server
-#
-# Layout assumed:
-#   GPU 0-1  →  20B model  →  vLLM on port 5002
-#   GPU 2    →  8B  model  →  vLLM on port 5001
-#   GPU 3    →  hidden-state extraction (HF, loaded below)
 # ---------------------------------------------------------------------------
 _VLLM_REGISTRY: dict[str, tuple[str, int]] = {
     "meta-llama/Llama-3.1-8B-Instruct":  ("127.0.0.1", 5001),
-    "microsoft/phi-4":         ("127.0.0.1", 5002),
-    # Add more models here as needed, e.g.:
-    # "another/model": ("127.0.0.1", 5003),
+    "Qwen/Qwen2.5-14B-Instruct":         ("127.0.0.1", 5002),
 }
-
-# GPU reserved exclusively for hidden-state extraction
-# _ACTIVATION_GPU = "cuda:1"  # "cuda:3" --- IGNORE --- using both 1 and 2 to load the 20B model for extraction
-
-# Model to load on _ACTIVATION_GPU for hidden-state extraction.
-# Must be the same weights the activation_tracker expects (8B by default).
-_ACTIVATION_MODEL = DEFAULT_MODEL
 
 
 def format_messages(messages: list[dict], variables: dict = {}) -> list[dict]:
@@ -59,15 +39,12 @@ def format_messages(messages: list[dict], variables: dict = {}) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# HF model cache — only used for hidden-state extraction, pinned to GPU 3
+# Hidden-state extraction
 # ---------------------------------------------------------------------------
 _activation_model_cache: dict[str, tuple] = {}
-
-
-def _get_activation_model(model_name: str = _ACTIVATION_MODEL):
+def _get_activation_model(model_name):
     """
     Load (and cache) the HF model used for hidden-state extraction.
-    Pinned to _ACTIVATION_GPU (cuda:3) — never touches the vLLM GPUs.
     """
     if model_name not in _activation_model_cache:
         # print(f"[HF-activation] Loading '{model_name}' onto {_ACTIVATION_GPU} ...")
@@ -99,13 +76,21 @@ def _get_activation_model(model_name: str = _ACTIVATION_MODEL):
         # print(f"[HF-activation] '{model_name}' ready on {_ACTIVATION_GPU}.")
     return _activation_model_cache[model_name]
 
+def _apply_chat_template(messages: list[dict], tokenizer) -> str:
+    """Use tokenizer chat template if available, else fall back to ChatML."""
+    if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+        )
+    parts = [f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>" for m in messages]
+    parts.append("<|im_start|>assistant\n")
+    return "\n".join(parts)
+
 
 # ---------------------------------------------------------------------------
 # vLLM client — one instance per model, cached
 # ---------------------------------------------------------------------------
 _vllm_cache: dict[str, "vLLM"] = {}
-
-
 class vLLM:
     def __init__(
         self,
@@ -135,12 +120,14 @@ class vLLM:
         response = requests.post(self.url, json=payload)
         response.raise_for_status()
         data = response.json()
+        usage = data.get("usage", {})
         return {
             "message": data["choices"][0]["text"],
             "finish_reason": data["choices"][0].get("finish_reason"),
             "total_usd": 0.0,
+            "prompt_tokens": usage.get("prompt_tokens", 0),
+            "completion_tokens": usage.get("completion_tokens", 0),
         }
-
 
 def _get_vllm_client(
     model_name: str,
@@ -171,17 +158,6 @@ def _get_vllm_client(
     return _vllm_cache[model_name]
 
 
-def _apply_chat_template(messages: list[dict], tokenizer) -> str:
-    """Use tokenizer chat template if available, else fall back to ChatML."""
-    if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
-        return tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
-        )
-    parts = [f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>" for m in messages]
-    parts.append("<|im_start|>assistant\n")
-    return "\n".join(parts)
-
-
 # ---------------------------------------------------------------------------
 # Main Model class
 # ---------------------------------------------------------------------------
@@ -189,28 +165,20 @@ def _apply_chat_template(messages: list[dict], tokenizer) -> str:
 class Model:
     def __init__(self):
         pass
-
-    # ------------------------------------------------------------------
-    # Hidden-state extraction (always runs on GPU 3 via HF)
-    # ------------------------------------------------------------------
+    
     def record_activations(
         self,
         messages: list[dict],
-        model_name: str,           # which model weights to use for extraction
+        model_name: str,
         is_first_turn: bool,
         activation_tracker: ActivationTracker,
     ) -> None:
-        # Always use the dedicated activation model on GPU 3.
-        # If you want the 20B hidden states you can pass model_name=_ACTIVATION_MODEL
-        # and load the 20B weights on GPU 3 (needs ~40 GB — won't fit on one V100).
-        # For now we default to the 8B model.
+        
         model, tokenizer = _get_activation_model(model_name)
 
         prompt = _apply_chat_template(messages, tokenizer)
-        # print("prompt for activation extraction:", prompt)
         inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
         
-        t0 = time.time()
         with torch.no_grad():
             prefill_out = model(
                 **inputs,
@@ -226,13 +194,7 @@ class Model:
             activation_tracker.set_goal(hs)
         else:
             activation_tracker.record_activation(hs)
-
-        elapsed = time.time() - t0
-        # print(f"[record_activations] elapsed: {elapsed:.2f}s on {_ACTIVATION_GPU}")
-
-    # ------------------------------------------------------------------
-    # vLLM generation — routes to the correct server by model_name
-    # ------------------------------------------------------------------
+            
     def generate_vllm(
         self,
         messages: list[dict],
@@ -242,197 +204,46 @@ class Model:
     ) -> dict:
         client = _get_vllm_client(model_name, max_tokens=max_tokens, temperature=temperature)
         return client.inference(messages)
-
-    # ------------------------------------------------------------------
-    # HF steered generation (activation tracking + hook injection in one pass)
-    # ------------------------------------------------------------------
-    # def _steered_hf_generate(
-    #     self,
-    #     messages: list[dict],
-    #     model_name: str,
-    #     temperature: float,
-    #     max_tokens: int,
-    #     is_first_turn: bool,
-    #     activation_tracker: Optional[ActivationTracker],
-    #     steering_controller: SteeringController,
-    #     steer_goal_coords: Optional[dict],
-    # ) -> dict:
-    #     """
-    #     Single-pass HF generation with per-layer activation steering.
-
-    #     Each layer in steering_controller.steer_layers independently:
-    #       - measures its own goal-imprint gap
-    #       - computes its own proportional alpha
-    #       - applies its own steering vector during generation
-
-    #     Steps:
-    #       1. Prefill-only forward pass to extract hidden states.
-    #       2. Update activation_tracker (set_goal on turn 1, record after).
-    #       3. Per layer: extract coord, compute alpha, register hook.
-    #       4. model.generate() with all hooks active.
-    #       5. Return response dict with per-layer steering metadata.
-    #     """
-    #     model, tokenizer = _get_activation_model(model_name)
-
-    #     # Tokenise and move input to the first device in the device_map
-    #     prompt = _apply_chat_template(messages, tokenizer)
-    #     inputs = tokenizer(prompt, return_tensors="pt")
-    #     device = model.model.embed_tokens.weight.device
-    #     input_ids = inputs["input_ids"].to(device)
-    #     attention_mask = inputs.get("attention_mask")
-    #     if attention_mask is not None:
-    #         attention_mask = attention_mask.to(device)
-
-    #     # 1. Prefill for hidden-state extraction (no KV cache needed here)
-    #     with torch.no_grad():
-    #         prefill_out = model(
-    #             input_ids=input_ids,
-    #             attention_mask=attention_mask,
-    #             output_hidden_states=True,
-    #             use_cache=False,
-    #         )
-    #     hs = list(prefill_out.hidden_states)
-
-    #     # 2. Update activation tracker
-    #     if activation_tracker is not None:
-    #         if is_first_turn:
-    #             activation_tracker.set_goal(hs)
-    #         else:
-    #             activation_tracker.record_activation(hs)
-
-    #     # 3. Per-layer: extract coords, compute alpha, register hook
-    #     current_coords: dict[int, float] = steering_controller.extract_coords(hs)
-    #     alphas_used:    dict[int, float] = {}
-    #     new_goal_coords: dict[int, float] = {}
-    #     hook_handles = []
-
-    #     for layer_idx in steering_controller.steer_layers:
-    #         current = current_coords[layer_idx]
-    #         if is_first_turn:
-    #             # Turn 1: record goal position, no steering
-    #             new_goal_coords[layer_idx] = current
-    #             alphas_used[layer_idx] = 0.0
-    #         elif steer_goal_coords is not None:
-    #             new_goal_coords[layer_idx] = steer_goal_coords[layer_idx]
-    #             alpha = steering_controller.compute_steer_alpha(
-    #                 steer_goal_coords[layer_idx], current
-    #             )
-    #             alphas_used[layer_idx] = alpha
-    #             hook_fn = steering_controller.make_hook(alpha, layer_idx)
-    #             if hook_fn is not None:
-    #                 hook_handles.append(
-    #                     model.model.layers[layer_idx].register_forward_hook(hook_fn)
-    #                 )
-    #         else:
-    #             new_goal_coords[layer_idx] = current
-    #             alphas_used[layer_idx] = 0.0
-
-    #     # 4. Autoregressive generation with KV cache
-    #     gen_kwargs: dict = dict(
-    #         input_ids=input_ids,
-    #         attention_mask=attention_mask,
-    #         max_new_tokens=max_tokens,
-    #         pad_token_id=(
-    #             tokenizer.pad_token_id
-    #             if tokenizer.pad_token_id is not None
-    #             else tokenizer.eos_token_id
-    #         ),
-    #     )
-    #     if temperature > 0:
-    #         gen_kwargs["do_sample"] = True
-    #         gen_kwargs["temperature"] = temperature
-    #     else:
-    #         gen_kwargs["do_sample"] = False
-
-    #     model.config.use_cache = True
-    #     try:
-    #         with torch.no_grad():
-    #             output_ids = model.generate(**gen_kwargs)
-    #     finally:
-    #         model.config.use_cache = False
-    #         for h in hook_handles:
-    #             h.remove()
-
-    #     # 5. Decode new tokens only
-    #     n_input = input_ids.shape[1]
-    #     message = tokenizer.decode(
-    #         output_ids[0, n_input:], skip_special_tokens=True
-    #     )
-
-    #     return {
-    #         "message":              message,
-    #         "finish_reason":        "stop",
-    #         "total_usd":            0.0,
-    #         "steer_goal_coords":    new_goal_coords,    # dict[layer → float]
-    #         "steer_current_coords": current_coords,     # dict[layer → float]
-    #         "steer_alphas":         alphas_used,        # dict[layer → float]
-    #     }
-
+    
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
     def generate(
         self,
         messages: list[dict],
-        model_name: str = DEFAULT_MODEL,
+        model_name: str = "meta-llama/Llama-3.1-8B-Instruct",
         max_retries: int = 3,
         temperature: float = 0,
         max_tokens: Optional[int] = None,
         variables: dict = {},
         is_first_turn: Optional[bool] = None,
         activation_tracker=None,
-        
-        inertia_checker: Optional[InertiaChecker] = None,
-        context_compressor: Optional[ContextCompressor] = None,
-
         return_metadata: bool = False,
-        # steering_controller: Optional[SteeringController] = None,
-        # steer_goal_coords: Optional[dict] = None,
     ) -> dict:
+        
+        # Format the prompt with any provided variables.
         messages = format_messages(list(messages), variables)
         max_tokens = max_tokens or 1000
 
         last_exc: Optional[Exception] = None
-        t0 = time.time()
 
         for attempt in range(max_retries):
             try:
-                # Context compression — must be first so all downstream steps
-                # (activation tracking, inertia check, vLLM) see the same input.
-                compression_meta = None
-                if context_compressor is not None:
-                    messages, compression_meta = context_compressor.compress(messages)
-
                 # Original path: optional activation extraction, then vLLM
                 if activation_tracker is not None:
                     self.record_activations(
                         messages,
-                        _ACTIVATION_MODEL,
+                        model_name,
                         is_first_turn,
                         activation_tracker,
                     )
 
-                # Inertia check: if trajectory violates correct mechanical
-                # inertia, inject an intervention into the messages before
-                # passing to the generation backend.
-                generation_messages = messages
-                
-                inertia_info = None
-                if inertia_checker is not None and activation_tracker is not None:
-                    passed, inertia_info = inertia_checker.check(activation_tracker)
-                    if not passed:
-                        generation_messages = inertia_checker.inject_into_messages(
-                            messages, inertia_info["reason"]
-                        )
-
                 response = self.generate_vllm(
-                    generation_messages, model_name, temperature, max_tokens
+                    messages, 
+                    model_name, 
+                    temperature, 
+                    max_tokens
                 )
-
-                if inertia_info is not None:
-                    response["inertia_info"] = inertia_info
-                if compression_meta is not None:
-                    response["compression_meta"] = compression_meta
 
                 return response
 
@@ -447,7 +258,7 @@ class Model:
     def generate_json(
         self,
         messages: list[dict],
-        model: str = DEFAULT_MODEL,
+        model: str = "meta-llama/Llama-3.1-8B-Instruct",
         **kwargs,
     ) -> dict:
         """Like generate() but parses the response as JSON."""
